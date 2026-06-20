@@ -25,7 +25,7 @@ name: 🧪 Unit Tests
 runs-on: ubuntu-22.04
 timeout-minutes: 15
 
-```
+
 steps:
   - uses: actions/checkout@v4
 
@@ -51,14 +51,14 @@ steps:
       name: pr-surefire-reports
       path: java-app/**/target/surefire-reports/*.xml
       retention-days: 7
-```
+
 
 integration-tests:
 name: 🔗 Integration Tests
 runs-on: ubuntu-22.04
 timeout-minutes: 25
 
-```
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -105,14 +105,14 @@ steps:
       name: pr-failsafe-reports
       path: java-app/**/target/failsafe-reports/*.xml
       retention-days: 7
-```
+
 
 dependency-scan:
 name: 📚 Dependency Scan
 runs-on: ubuntu-22.04
 timeout-minutes: 15
 
-```
+
 steps:
   - uses: actions/checkout@v4
 
@@ -129,8 +129,7 @@ steps:
 
   - name: OWASP Dependency Check
     working-directory: java-app
-    run: |
-      ./mvnw -B -ntp org.owasp:dependency-check-maven:check
+    run: ./mvnw -B -ntp org.owasp:dependency-check-maven:check
 
   - name: Upload Dependency Report
     if: always()
@@ -139,4 +138,4 @@ steps:
       name: dependency-check-report
       path: java-app/target/dependency-check-report.html
       retention-days: 14
-```
+
