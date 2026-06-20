@@ -1,0 +1,21 @@
+# Binds the github-actions-deployer ClusterRole to the principal that
+# the GitHub Actions OIDC role assumes via aws-auth. Subject name MUST
+# match the username declared in the aws-auth ConfigMap
+# (iam/README.md §3, Option B) or the access entry's Kubernetes username
+# (Option A — set `username` to the access entry's Kubernetes group).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: github-actions-deployer
+  labels:
+    app.kubernetes.io/name: spring-boot-app
+    app.kubernetes.io/component: ci-cd
+    managed-by: manual
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: github-actions-deployer
+subjects:
+  - kind: User
+    name: github-actions
+    apiGroup: rbac.authorization.k8s.io

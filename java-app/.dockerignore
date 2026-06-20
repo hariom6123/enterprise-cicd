@@ -1,0 +1,13 @@
+# Local Maven Wrapper — created via `mvn -N wrapper:wrapper`
+# Pipeline / Dockerfile do not need these to be committed (the CI runner ships
+# its own mvn), but the Dockerfile's builder stage runs `./mvnw`, so keep them
+# in version control.
+target/
+.idea/
+*.iml
+.git/
+.gitignore
+README.md
+docker-compose*.yml
+Dockerfile
+.dockerignore

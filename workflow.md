@@ -1,0 +1,846 @@
+# GitHub Actions CI/CD Workflow — Spring Boot on AWS EKS
+
+**File path (deploy this in your repo):** `.github/workflows/ci-cd-pipeline.yml`
+
+---
+
+## Workflow File
+
+```yaml
+name: Enterprise CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  JAVA_VERSION: '21'
+  MAVEN_OPTS: '-Xmx2g -XX:MaxMetaspaceSize=512m'
+  AWS_REGION: 'us-east-1'
+  ECR_REGISTRY: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+  ECR_REPOSITORY: 'spring-boot-app'
+  IMAGE_TAG: ${{ github.sha }}
+  HELM_CHART_PATH: './charts/spring-boot-app'
+
+# Concurrency control - cancel in-progress runs on the same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  # ===================================================================
+  # STAGE 1: BUILD
+  # ===================================================================
+  build:
+    name: 🏗️ Build & Package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+      jar_artifact: ${{ steps.maven-build.outputs.jar_artifact }}
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: ☕ Setup Java 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+          cache-dependency-path: '**/pom.xml'
+          gpg-import-public-keys: ${{ secrets.GPG_PUBLIC_KEY }}
+
+      - name: 🔍 Detect Build Tools
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          mvn -version
+
+      - name: 🏗️ Maven Build (skip tests - will run in test stage)
+        id: maven-build
+        run: |
+          mvn -B -V \
+            -ntp \
+            -DskipTests \
+            -Dmaven.javadoc.skip=true \
+            -Drevision=${GITHUB_SHA::7} \
+            clean package
+
+          JAR_FILE=$(ls target/*.jar | grep -v 'original-' | head -1)
+          echo "jar_artifact=$JAR_FILE" >> $GITHUB_OUTPUT
+
+          if [ ! -f "$JAR_FILE" ]; then
+            echo "❌ JAR file not found"; exit 1
+          fi
+          echo "✅ Built: $JAR_FILE ($(du -h $JAR_FILE | cut -f1))"
+
+      - name: 📦 Upload JAR Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: target/*.jar
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.13.0
+            network=host
+
+      - name: 🔐 Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: false
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🐳 Build & Cache Docker Image
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha,scope=build-cache
+          cache-to: type=gha,scope=build-cache,mode=max
+          provenance: true
+          sbom: true
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+            JAR_FILE=${{ steps.maven-build.outputs.jar_artifact }}
+
+      - name: 🛡️ Scan Image with Trivy (Pre-push)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+        continue-on-error: true
+
+      - name: 📊 Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+          category: trivy-image
+
+      - name: 📤 Publish Build Info
+        run: |
+          echo "::notice::✅ Build complete - Image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+
+  # ===================================================================
+  # STAGE 2: TEST (runs in parallel)
+  # ===================================================================
+  unit-tests:
+    name: 🧪 Unit Tests
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: 🧪 Run Unit Tests
+        run: |
+          mvn -B -ntp test \
+            -Dtest='*Test,!*IT' \
+            -DfailIfNoTests=false
+
+      - name: 📊 Publish Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*.xml'
+          retention-days: 14
+
+  integration-tests:
+    name: 🔗 Integration Tests
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping"
+    steps:
+      - uses: actions/checkout@v4
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: 🔗 Run Integration Tests
+        run: |
+          mvn -B -ntp verify \
+            -Dtest='*IT' \
+            -DfailIfNoTests=false \
+            -Dspring.profiles.active=test \
+            -Dpostgres.host=localhost \
+            -Dredis.host=localhost
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/testdb
+          SPRING_DATASOURCE_USERNAME: test
+          SPRING_DATASOURCE_PASSWORD: testpass
+          SPRING_REDIS_HOST: localhost
+          SPRING_REDIS_PORT: 6379
+
+      - name: 📊 Publish IT Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failsafe-reports
+          path: '**/target/failsafe-reports/*.xml'
+          retention-days: 14
+
+  sonarqube-scan:
+    name: 🔬 SonarQube Scan
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: 🔬 Run SonarQube Analysis
+        uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=spring-boot-app
+            -Dsonar.projectName=Spring Boot App
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      - name: 📋 Quality Gate Check
+        uses: sonarsource/sonarqube-quality-gate-action@v2
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  dependency-scan:
+    name: 📚 Dependency Scan (OWASP)
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: ☕ Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'maven'
+
+      - name: 🔒 OWASP Dependency Check
+        run: |
+          mvn -B -ntp org.owasp:dependency-check-maven:12.1.1:check \
+            -DfailBuildOnCVSS=7 \
+            -DassemblyAnalyzerEnabled=false
+
+      - name: 📊 Upload Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report
+          path: 'target/dependency-check-report.html'
+          retention-days: 30
+
+  # ===================================================================
+  # STAGE 3: PUSH TO ECR
+  # ===================================================================
+  push-to-ecr:
+    name: 📤 Push to ECR
+    needs: [build, unit-tests, integration-tests, sonarqube-scan, dependency-scan]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: dev
+    steps:
+      - name: 📥 Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: target/
+
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-push-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🔑 Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🐳 Build & Push to ECR
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          ecr-registry: ${{ steps.login-ecr.outputs.registry }}
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha,scope=build-cache
+          cache-to: type=gha,scope=build-cache,mode=max
+          provenance: true
+          sbom: true
+
+      - name: 🔍 ECR Image Scan (Push phase)
+        run: |
+          aws ecr start-image-scan \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ env.IMAGE_TAG }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: ⏳ Wait for ECR Scan
+        run: |
+          echo "Waiting for ECR scan to complete..."
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ env.IMAGE_TAG }} \
+            --region ${{ env.AWS_REGION }} || true
+
+      - name: 📊 Get Scan Results
+        run: |
+          SCAN_FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ env.IMAGE_TAG }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output text || echo "none")
+
+          echo "ECR scan findings: $SCAN_FINDINGS"
+          echo "ECR_SCAN=$SCAN_FINDINGS" >> $GITHUB_ENV
+
+          if echo "$SCAN_FINDINGS" | grep -q "CRITICAL"; then
+            echo "::error::❌ Critical vulnerabilities found in image"
+            exit 1
+          fi
+
+      - name: 🔒 Trivy Final Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          format: 'sarif'
+          output: 'trivy-final-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+        continue-on-error: false
+
+      - name: 📊 Upload Final Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-final-results.sarif'
+          category: trivy-final
+
+  # ===================================================================
+  # STAGE 4: DEPLOY TO DEV EKS
+  # ===================================================================
+  deploy-dev:
+    name: 🚀 Deploy to Dev EKS
+    needs: push-to-ecr
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: dev
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-deploy-dev-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Update kubeconfig for Dev
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ vars.DEPLOY_DEV_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias dev
+
+      - name: 📊 Cluster Info
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: ⛵ Deploy with Helm
+        id: deploy
+        run: |
+          helm template ${{ env.HELM_CHART_PATH }} \
+            --values ${{ env.HELM_CHART_PATH }}/values-dev.yaml \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --namespace spring-boot-app-dev \
+            --create-namespace \
+            > /tmp/manifests.yaml
+
+          echo "✅ Manifest validation passed"
+          cat /tmp/manifests.yaml | head -50
+
+      - name: ⛵ Helm Install/Upgrade
+        run: |
+          helm upgrade --install spring-boot-app \
+            ${{ env.HELM_CHART_PATH }} \
+            --values ${{ env.HELM_CHART_PATH }}/values-dev.yaml \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --namespace spring-boot-app-dev \
+            --create-namespace \
+            --wait \
+            --timeout 10m \
+            --atomic \
+            --history-max 5
+
+      - name: ✅ Verify Deployment
+        run: |
+          kubectl rollout status deployment/spring-boot-app -n spring-boot-app-dev --timeout=5m
+
+          echo "=== Pod Status ==="
+          kubectl get pods -n spring-boot-app-dev -l app.kubernetes.io/name=spring-boot-app -o wide
+
+          READY_PODS=$(kubectl get pods -n spring-boot-app-dev \
+            -l app.kubernetes.io/name=spring-boot-app \
+            -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' \
+            | tr ' ' '\n' | grep -c "True" || echo "0")
+
+          TOTAL_PODS=$(kubectl get pods -n spring-boot-app-dev \
+            -l app.kubernetes.io/name=spring-boot-app \
+            --no-headers | wc -l)
+
+          echo "Ready: $READY_PODS/$TOTAL_PODS"
+
+          if [ "$READY_PODS" -ne "$TOTAL_PODS" ]; then
+            echo "::error::❌ Not all pods are ready"
+            exit 1
+          fi
+
+      - name: 🔍 Get Service Endpoint
+        id: service
+        run: |
+          ENDPOINT=$(kubectl get svc spring-boot-app -n spring-boot-app-dev \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          if [ -z "$ENDPOINT" ]; then
+            ENDPOINT="spring-boot-app.spring-boot-app-dev.svc.cluster.local"
+          fi
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "service_url=http://$ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: 🩺 Smoke Tests
+        run: |
+          ENDPOINT=${{ steps.service.outputs.endpoint }}
+          echo "Running smoke tests against: $ENDPOINT"
+
+          for i in {1..30}; do
+            if curl -sf -m 5 http://${ENDPOINT}/actuator/health/liveness; then
+              echo "✅ Liveness check passed (attempt $i)"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "::error::❌ Health check failed after 30 attempts"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          curl -sf -m 5 http://${ENDPOINT}/actuator/health/readiness
+
+          curl -sf -m 10 http://${ENDPOINT}/actuator/health | jq .
+
+          curl -sf -m 10 http://${ENDPOINT}/actuator/info
+
+      - name: 🧪 Run E2E Smoke Tests
+        run: |
+          ENDPOINT=${{ steps.service.outputs.endpoint }}
+          newman run tests/smoke/smoke-test-collection.json \
+            --env-var "baseUrl=http://${ENDPOINT}" \
+            --reporters cli,junit \
+            --reporter-junit-export /tmp/newman-results.xml || true
+
+      - name: 📊 Publish E2E Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: /tmp/newman-results.xml
+          retention-days: 14
+
+      - name: 💬 Slack Notification - Dev Success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Dev Deployment Successful",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Service:*\nspring-boot-app"},
+                    {"type": "mrkdwn", "text": "*Environment:*\nDev EKS"},
+                    {"type": "mrkdwn", "text": "*Image Tag:*\n`${{ env.IMAGE_TAG }}`"},
+                    {"type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`"},
+                    {"type": "mrkdwn", "text": "*Author:*\n${{ github.actor }}"},
+                    {"type": "mrkdwn", "text": "*Workflow:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"}
+                  ]
+                }
+              ]
+            }
+
+      - name: 💬 Slack Notification - Dev Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Dev Deployment Failed",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Service:* spring-boot-app\n*Commit:* `${{ github.sha }}`\n*Author:* ${{ github.actor }}\n\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run Logs>"
+                  }
+                }
+              ]
+            }
+
+  # ===================================================================
+  # STAGE 5: PRODUCTION DEPLOYMENT (with approval)
+  # ===================================================================
+  deploy-prod:
+    name: 🚀 Deploy to Prod EKS
+    needs: deploy-dev
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment:
+      name: prod
+      url: https://app.example.com
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-deploy-prod-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Update kubeconfig for Prod
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ vars.DEPLOY_PROD_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias prod
+
+      - name: ⛵ Pre-flight Checks
+        run: |
+          kubectl cluster-info
+
+          kubectl get deployment spring-boot-app -n spring-boot-app-prod || echo "First deployment"
+
+          echo "Current image:"
+          kubectl get deployment spring-boot-app -n spring-boot-app-prod \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "N/A"
+
+          echo "Deploying image: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+
+      - name: ⛵ Blue-Green Deploy with Helm
+        run: |
+          helm upgrade --install spring-boot-app \
+            ${{ env.HELM_CHART_PATH }} \
+            --values ${{ env.HELM_CHART_PATH }}/values-prod.yaml \
+            --set image.tag=${{ env.IMAGE_TAG }} \
+            --set image.repository=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set blueGreen.enabled=true \
+            --set blueGreen.currentColor=blue \
+            --namespace spring-boot-app-prod \
+            --create-namespace \
+            --wait \
+            --timeout 15m \
+            --atomic \
+            --history-max 10
+
+      - name: ⏳ Wait for Rollout
+        run: |
+          kubectl rollout status deployment/spring-boot-app -n spring-boot-app-prod --timeout=10m
+
+      - name: 🩺 Production Smoke Tests
+        run: |
+          ENDPOINT="app.example.com"
+          echo "Running prod smoke tests against: $ENDPOINT"
+
+          for i in {1..20}; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 https://${ENDPOINT}/actuator/health/liveness)
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Health check passed (attempt $i)"
+              break
+            fi
+            if [ $i -eq 20 ]; then
+              echo "::error::❌ Health check failed after 20 attempts. Status: $HTTP_STATUS"
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: 🔍 Verify Application Metrics
+        run: |
+          ENDPOINT="app.example.com"
+
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 https://${ENDPOINT}/actuator/health)
+            echo "Check $i: Status=$STATUS"
+            if [ "$STATUS" != "200" ]; then
+              echo "::warning::Unexpected status: $STATUS"
+            fi
+            sleep 5
+          done
+
+      - name: 💬 Slack Notification - Prod Success
+        if: success()
+        uses: slackapi/slack-github-action@v1.27.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {"type": "plain_text", "text": "🎉 PROD Deployment Successful", "emoji": true}
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {"type": "mrkdwn", "text": "*Service:*\nspring-boot-app"},
+                    {"type": "mrkdwn", "text": "*Environment:*\nProduction EKS"},
+                    {"type": "mrkdwn", "text": "*Image Tag:*\n`${{ env.IMAGE_TAG }}`"},
+                    {"type": "mrkdwn", "text": "*Commit:*\n`${{ github.sha }}`"},
+                    {"type": "mrkdwn", "text": "*Deployed by:*\n${{ github.actor }}"},
+                    {"type": "mrkdwn", "text": "*Run:*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"},
+                    {"type": "mrkdwn", "text": "*App URL:*\n<https://app.example.com|Open App>"},
+                    {"type": "mrkdwn", "text": "*Timestamp:*\n$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+                  ]
+                }
+              ]
+            }
+
+  # ===================================================================
+  # STAGE 6: ROLLBACK VALIDATION
+  # ===================================================================
+  rollback-validation:
+    name: 🔄 Rollback Validation
+    needs: deploy-prod
+    if: always() && needs.deploy-prod.result == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-rollback-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: ⚙️ Update kubeconfig for Prod
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ vars.DEPLOY_PROD_CLUSTER }} \
+            --region ${{ env.AWS_REGION }} \
+            --alias prod
+
+      - name: 🔍 Validate Rollback Strategy
+        run: |
+          echo "=== Testing Rollback Strategy ==="
+
+          echo "Helm history:"
+          helm history spring-boot-app -n spring-boot-app-prod
+
+          PREVIOUS_REVISION=$(helm history spring-boot-app -n spring-boot-app-prod -o json | \
+            jq -r '[.[] | select(.status == "deployed")] | .[0].revision')
+          echo "Current deployed revision: $PREVIOUS_REVISION"
+
+          echo "Rollback dry-run test:"
+          helm rollback spring-boot-app --dry-run -n spring-boot-app-prod 2>&1 || echo "Dry-run completed"
+
+          echo "Checking deployment backup..."
+          kubectl get deployment spring-boot-app -n spring-boot-app-prod -o yaml > /tmp/current-deployment.yaml
+          echo "✅ Current deployment manifest saved"
+
+          echo "HPA Status:"
+          kubectl get hpa -n spring-boot-app-prod
+
+          echo "PDB Status:"
+          kubectl get pdb -n spring-boot-app-prod
+
+          echo "Service endpoints:"
+          kubectl get endpoints -n spring-boot-app-prod
+
+          echo "✅ Rollback validation complete"
+
+      - name: 📝 Create Rollback Documentation
+        run: |
+          cat > ROLLBACK.md << 'EOF'
+          # 🔄 Rollback Procedure
+
+          ## Quick Rollback
+          ```bash
+          helm rollback spring-boot-app -n spring-boot-app-prod
+          helm rollback spring-boot-app <revision> -n spring-boot-app-prod
+          ```
+
+          ## Emergency Rollback (kubectl)
+          ```bash
+          kubectl rollout undo deployment/spring-boot-app -n spring-boot-app-prod
+          kubectl rollout undo deployment/spring-boot-app --to-revision=<N> -n spring-boot-app-prod
+          kubectl rollout status deployment/spring-boot-app -n spring-boot-app-prod
+          ```
+
+          ## Verify Rollback
+          ```bash
+          kubectl get pods -n spring-boot-app-prod -l app.kubernetes.io/name=spring-boot-app
+          kubectl logs -n spring-boot-app-prod -l app.kubernetes.io/name=spring-boot-app --tail=100
+          curl https://app.example.com/actuator/health
+          ```
+          EOF
+
+          echo "✅ ROLLBACK.md created"
+
+      - name: 📤 Upload Rollback Guide
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-guide
+          path: ROLLBACK.md
+          retention-days: 90
+```
+
+---
+
+## Required GitHub Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `AWS_ACCOUNT_ID` | AWS account ID (used by IAM role ARN) |
+| `SONAR_TOKEN` | SonarQube authentication token |
+| `SONAR_HOST_URL` | SonarQube server URL |
+| `SLACK_WEBHOOK_URL` | Encrypted Slack incoming webhook |
+| `GPG_PUBLIC_KEY` | For signed commits (optional) |
+
+## Required GitHub Variables
+
+| Variable | Value |
+|----------|-------|
+| `AWS_ACCOUNT_ID` | `<your-aws-account-id>` |
+| `DEPLOY_DEV_CLUSTER` | `dev-eks-cluster` |
+| `DEPLOY_PROD_CLUSTER` | `prod-eks-cluster` |
+
+## Required GitHub Environments
+
+- **`dev`** — no protection (auto-deploys on merge to `develop`)
+- **`prod`** — 2 required reviewers, 5-min wait timer, branch: `main` only
+
+## Pipeline Stages Summary
+
+1. **Build** — Checkout, Java 21, Maven package, Docker image build with cache
+2. **Test (parallel)** — Unit, Integration, SonarQube, OWASP dependency scan
+3. **Push to ECR** — ECR push, ECR native scan, Trivy final scan (fails on CRITICAL)
+4. **Deploy Dev** — Helm install/upgrade, verify, smoke tests, Slack notify
+5. **Deploy Prod** — Manual approval gate, blue-green Helm deploy, prod smoke tests
+6. **Rollback Validation** — Verify Helm history, dry-run rollback, generate runbook

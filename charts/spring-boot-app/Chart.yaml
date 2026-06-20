@@ -1,0 +1,22 @@
+apiVersion: v2
+name: spring-boot-app
+description: Enterprise Spring Boot Application
+type: application
+version: 1.2.0
+appVersion: "1.0.0"
+keywords:
+  - spring-boot
+  - java
+  - microservice
+maintainers:
+  - name: Platform Team
+    email: platform@example.com
+dependencies:
+  - name: postgresql
+    version: 15.5.0
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: 20.7.0
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled

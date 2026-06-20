@@ -1,0 +1,64 @@
+# ClusterRole bound to the GitHub Actions deployer principal (username
+# `github-actions` from iam/README.md's aws-auth ConfigMap, or the access
+# entry ARN from the IAM Access Entries path on EKS 1.23+).
+#
+# This ClusterRole is cluster-scoped because Helm releases and the
+# Argo-style chart lifecycle (CRDs, ClusterRoles for monitoring
+# operators, etc.) often need cluster-wide verbs. If you want to lock
+# it down to namespace scope, change the resource list to specific
+# namespaces and replace the ClusterRoleBinding with a RoleBinding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: github-actions-deployer
+  labels:
+    app.kubernetes.io/name: spring-boot-app
+    app.kubernetes.io/component: ci-cd
+    managed-by: manual
+rules:
+  # Core resources used by Helm + kubectl during deploys and verification.
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - configmaps
+      - secrets
+      - serviceaccounts
+      - events
+      - pods
+      - pods/log
+      - services
+      - endpoints
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Workload controllers.
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - replicasets
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Networking (the chart ships a NetworkPolicy and an Ingress).
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingresses
+      - networkpolicies
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Autoscaling + disruption budgets.
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Prometheus Operator CRDs (the chart ships a ServiceMonitor).
+  - apiGroups: ["monitoring.coreos.com"]
+    resources:
+      - servicemonitors
+      - podmonitors
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
