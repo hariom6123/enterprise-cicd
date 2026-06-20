@@ -1,141 +1,141 @@
 name: PR Validation
 
 on:
-pull_request:
-branches:
-- main
-- develop
+  pull_request:
+    branches:
+      - main
+      - develop
 
 concurrency:
-group: pr-validation-${{ github.event.pull_request.number }}
-cancel-in-progress: true
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 permissions:
-contents: read
-pull-requests: write
-security-events: write
+  contents: read
+  pull-requests: write
+  security-events: write
 
 env:
-JAVA_VERSION: '21'
-MAVEN_OPTS: '-Xmx2g -XX:MaxMetaspaceSize=512m'
+  JAVA_VERSION: '21'
+  MAVEN_OPTS: '-Xmx2g -XX:MaxMetaspaceSize=512m'
 
 jobs:
-unit-tests:
-name: 🧪 Unit Tests
-runs-on: ubuntu-22.04
-timeout-minutes: 15
+  unit-tests:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
+    steps:
+      - uses: actions/checkout@v4
 
-steps:
-  - uses: actions/checkout@v4
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+          cache-dependency-path: java-app/pom.xml
 
-  - name: ☕ Setup Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: ${{ env.JAVA_VERSION }}
-      cache: maven
-      cache-dependency-path: java-app/pom.xml
+      - name: Make Maven Wrapper Executable
+        run: chmod +x java-app/mvnw
 
-  - name: Make Maven Wrapper Executable
-    run: chmod +x java-app/mvnw
+      - name: Run Unit Tests
+        working-directory: java-app
+        run: ./mvnw -B -ntp test -DfailIfNoTests=false
 
-  - name: Run Unit Tests
-    working-directory: java-app
-    run: ./mvnw -B -ntp test -DfailIfNoTests=false
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-surefire-reports
+          path: java-app/**/target/surefire-reports/*.xml
+          retention-days: 7
 
-  - name: Upload Test Results
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: pr-surefire-reports
-      path: java-app/**/target/surefire-reports/*.xml
-      retention-days: 7
+  integration-tests:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
-integration-tests:
-name: 🔗 Integration Tests
-runs-on: ubuntu-22.04
-timeout-minutes: 25
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
 
+    steps:
+      - uses: actions/checkout@v4
 
-services:
-  postgres:
-    image: postgres:16-alpine
-    env:
-      POSTGRES_DB: testdb
-      POSTGRES_USER: test
-      POSTGRES_PASSWORD: testpass
-    ports:
-      - 5432:5432
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+          cache-dependency-path: java-app/pom.xml
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - 6379:6379
+      - name: Make Maven Wrapper Executable
+        run: chmod +x java-app/mvnw
 
-steps:
-  - uses: actions/checkout@v4
+      - name: Run Integration Tests
+        working-directory: java-app
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/testdb
+          SPRING_DATASOURCE_USERNAME: test
+          SPRING_DATASOURCE_PASSWORD: testpass
+          SPRING_REDIS_HOST: localhost
+          SPRING_REDIS_PORT: 6379
+        run: ./mvnw -B -ntp verify -DfailIfNoTests=false
 
-  - name: ☕ Setup Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: ${{ env.JAVA_VERSION }}
-      cache: maven
-      cache-dependency-path: java-app/pom.xml
+      - name: Upload Integration Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-failsafe-reports
+          path: java-app/**/target/failsafe-reports/*.xml
+          retention-days: 7
 
-  - name: Make Maven Wrapper Executable
-    run: chmod +x java-app/mvnw
+  dependency-scan:
+    name: 📚 Dependency Scan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
-  - name: Run Integration Tests
-    working-directory: java-app
-    env:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/testdb
-      SPRING_DATASOURCE_USERNAME: test
-      SPRING_DATASOURCE_PASSWORD: testpass
-      SPRING_REDIS_HOST: localhost
-      SPRING_REDIS_PORT: 6379
-    run: ./mvnw -B -ntp verify -DfailIfNoTests=false
+    steps:
+      - uses: actions/checkout@v4
 
-  - name: Upload Integration Test Results
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: pr-failsafe-reports
-      path: java-app/**/target/failsafe-reports/*.xml
-      retention-days: 7
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+          cache-dependency-path: java-app/pom.xml
 
+      - name: Make Maven Wrapper Executable
+        run: chmod +x java-app/mvnw
 
-dependency-scan:
-name: 📚 Dependency Scan
-runs-on: ubuntu-22.04
-timeout-minutes: 15
+      - name: OWASP Dependency Check
+        working-directory: java-app
+        run: |
+          ./mvnw -B -ntp org.owasp:dependency-check-maven:check
 
-
-steps:
-  - uses: actions/checkout@v4
-
-  - name: ☕ Setup Java
-    uses: actions/setup-java@v4
-    with:
-      distribution: temurin
-      java-version: ${{ env.JAVA_VERSION }}
-      cache: maven
-      cache-dependency-path: java-app/pom.xml
-
-  - name: Make Maven Wrapper Executable
-    run: chmod +x java-app/mvnw
-
-  - name: OWASP Dependency Check
-    working-directory: java-app
-    run: ./mvnw -B -ntp org.owasp:dependency-check-maven:check
-
-  - name: Upload Dependency Report
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: dependency-check-report
-      path: java-app/target/dependency-check-report.html
-      retention-days: 14
-
+      - name: Upload Dependency Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: java-app/target/dependency-check-report.html
+          retention-days: 14
