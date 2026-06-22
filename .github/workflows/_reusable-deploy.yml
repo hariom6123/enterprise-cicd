@@ -38,9 +38,8 @@ on:
     inputs:
       environment:
         description: 'Target environment — "dev" or "prod".'
-        type: choice
+        type: string
         required: true
-        options: [dev, prod]
       ecr-registry:
         description: 'ECR registry URL.'
         type: string
@@ -79,9 +78,8 @@ on:
         default: 'spring-boot-app'
       smoke-test-scheme:
         description: 'Scheme used by smoke tests ("http" or "https").'
-        type: choice
+        type: string
         required: false
-        options: [http, https]
         default: http
       smoke-test-host:
         description: 'Override the smoke-test host. Defaults to the cluster service DNS.'
