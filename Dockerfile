@@ -7,17 +7,18 @@
 FROM eclipse-temurin:17-jdk-jammy AS builder
 WORKDIR /build
 
-# Copy Maven files first (better caching)
-COPY pom.xml ./
-COPY .mvn .mvn
-COPY mvnw ./
+# Copy Maven files first (better caching).
+# Build context is the repo root, so paths are prefixed with java-app/.
+COPY java-app/pom.xml ./
+COPY java-app/.mvn .mvn
+COPY java-app/mvnw ./
 
 # Download dependencies (cached layer)
 RUN --mount=type=cache,target=/root/.m2 \
     ./mvnw dependency:go-offline -B -ntp
 
 # Copy source and build
-COPY src ./src
+COPY java-app/src ./src
 RUN --mount=type=cache,target=/root/.m2 \
     ./mvnw -B -ntp clean package -DskipTests \
     -Dmaven.javadoc.skip=true
