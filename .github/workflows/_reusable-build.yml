@@ -140,7 +140,7 @@ jobs:
             JAR_FILE=${{ steps.maven-build.outputs.jar_artifact }}
 
       - name: 🛡️ Scan Image with Trivy (Pre-push)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@0.29.0
         with:
           image-ref: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}
           format: 'sarif'
