@@ -27,24 +27,21 @@ permissions:
   pull-requests: write
   security-events: write
 
-env:
-  JAVA_VERSION: '17'
-
 jobs:
   unit-tests:
     name: 🧪 Unit Tests
     uses: ./.github/workflows/_reusable-unit-tests.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
 
   integration-tests:
     name: 🔗 Integration Tests
     uses: ./.github/workflows/_reusable-integration-tests.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
 
   dependency-scan:
     name: 📚 Dependency Scan
     uses: ./.github/workflows/_reusable-dependency-scan.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
