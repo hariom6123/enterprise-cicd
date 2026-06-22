@@ -147,11 +147,14 @@ serviceAccount:
   name: ""
 
 # Security Context
+# UID/GID 65532 matches the `nonroot` user in
+# gcr.io/distroless/java17-debian12:nonroot. K8s enforces this on the pod;
+# if the image's USER doesn't match, the kubelet will refuse to start it.
 podSecurityContext:
   runAsNonRoot: true
-  runAsUser: 10001
-  runAsGroup: 10001
-  fsGroup: 10001
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 
@@ -159,7 +162,7 @@ containerSecurityContext:
   allowPrivilegeEscalation: false
   readOnlyRootFilesystem: true
   runAsNonRoot: true
-  runAsUser: 10001
+  runAsUser: 65532
   capabilities:
     drop:
       - ALL

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # ====================================
-# Multi-stage build for Spring Boot
+# Multi-stage build for Spring Boot (distroless runtime)
 # ====================================
 
 # ---- Build Stage ----
@@ -27,7 +27,12 @@ RUN mkdir -p extracted && \
     java -Djarmode=layertools -jar target/*.jar extract --destination extracted
 
 # ---- Runtime Stage ----
-FROM eclipse-temurin:17-jre-jammy AS runtime
+# distroless/java17-debian12:nonroot ships:
+#   - JRE 17 (no JDK, no shell, no package manager)
+#   - /usr/bin/tini-static for proper PID 1 signal handling
+#   - non-root user named `nonroot` (UID 65532)
+# No HEALTHCHECK here — K8s probes handle that (see Helm chart values).
+FROM gcr.io/distroless/java17-debian12:nonroot
 
 # Metadata
 LABEL org.opencontainers.image.title="Spring Boot App" \
@@ -35,50 +40,34 @@ LABEL org.opencontainers.image.title="Spring Boot App" \
       org.opencontainers.image.source="https://github.com/org/spring-boot-app" \
       org.opencontainers.image.licenses="Proprietary"
 
-# Install security updates and required tools
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends \
-        curl \
-        tini \
-        dumb-init && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN groupadd -g 10001 spring && \
-    useradd -u 10001 -g 10001 -s /bin/bash -m spring
-
 WORKDIR /app
 
-# Copy Spring Boot layers (in optimal order)
-COPY --from=builder --chown=spring:spring /build/extracted/dependencies/ ./
-COPY --from=builder --chown=spring:spring /build/extracted/spring-boot-loader/ ./
-COPY --from=builder --chown=spring:spring /build/extracted/snapshot-dependencies/ ./
-COPY --from=builder --chown=spring:spring /build/extracted/application/ ./
+# Copy Spring Boot layers in optimal order
+COPY --from=builder --chown=nonroot:nonroot /build/extracted/dependencies/ ./
+COPY --from=builder --chown=nonroot:nonroot /build/extracted/spring-boot-loader/ ./
+COPY --from=builder --chown=nonroot:nonroot /build/extracted/snapshot-dependencies/ ./
+COPY --from=builder --chown=nonroot:nonroot /build/extracted/application/ ./
 
-# Create tmp directories (since readOnlyRootFilesystem)
-RUN mkdir -p /tmp/heapdumps /app/logs && \
-    chown -R spring:spring /tmp/heapdumps /app/logs
+# /tmp writable for heap dumps (distroless ships /tmp but it's empty)
+# nonroot already owns it, but be explicit:
+# (skip — default /tmp is fine and owned by nonroot in :nonroot variant)
 
-USER 10001:10001
+USER nonroot
 
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:8080/actuator/health/liveness || exit 1
+# Use tini-static for proper PID 1 signal handling (bundled in this image tag).
+# ENTRYPOINT + CMD use exec form (no shell — distroless has none).
+# JAVA_TOOL_OPTIONS is read by the JVM itself, so flags can still be overridden
+# at run time via -e JAVA_TOOL_OPTIONS=... without needing a shell.
+ENTRYPOINT ["/usr/bin/tini-static", "--"]
 
-# Use tini for proper signal handling
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENV JAVA_TOOL_OPTIONS="-XX:+UseG1GC \
+                       -XX:MaxRAMPercentage=75.0 \
+                       -XX:+ExitOnOutOfMemoryError \
+                       -XX:+HeapDumpOnOutOfMemoryError \
+                       -XX:HeapDumpPath=/tmp/heapdumps \
+                       -Djava.security.egd=file:/dev/./urandom \
+                       -Dspring.profiles.active=production"
 
-# JVM options
-ENV JAVA_OPTS="-XX:+UseG1GC \
-               -XX:MaxRAMPercentage=75.0 \
-               -XX:+ExitOnOutOfMemoryError \
-               -XX:+HeapDumpOnOutOfMemoryError \
-               -XX:HeapDumpPath=/tmp/heapdumps \
-               -Djava.security.egd=file:/dev/./urandom \
-               -Dspring.profiles.active=production"
-
-CMD ["sh", "-c", "exec java $JAVA_OPTS org.springframework.boot.loader.launch.JarLauncher"]
+CMD ["org.springframework.boot.loader.launch.JarLauncher"]
