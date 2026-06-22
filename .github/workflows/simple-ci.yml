@@ -47,6 +47,12 @@ jobs:
           cache: maven
           cache-dependency-path: java-app/pom.xml
 
+      - name: Make mvnw executable
+        # On Windows checkouts the file lands at 100644 with no execute bit.
+        # Ubuntu runners then fail with "Permission denied" on ./mvnw.
+        working-directory: java-app
+        run: chmod +x ./mvnw
+
       - name: Build with Maven
         working-directory: java-app
         run: ./mvnw -B -ntp -Drevision=${GITHUB_SHA::7} clean package -DskipTests
@@ -79,6 +85,9 @@ jobs:
           java-version: '17'
           cache: maven
           cache-dependency-path: java-app/pom.xml
+      - name: Make mvnw executable
+        working-directory: java-app
+        run: chmod +x ./mvnw
       - name: Run unit tests
         working-directory: java-app
         run: ./mvnw -B -ntp test -Dtest='*Test,!*IT'
@@ -95,6 +104,9 @@ jobs:
           java-version: '17'
           cache: maven
           cache-dependency-path: java-app/pom.xml
+      - name: Make mvnw executable
+        working-directory: java-app
+        run: chmod +x ./mvnw
       - name: Run integration tests
         working-directory: java-app
         run: ./mvnw -B -ntp verify -Dtest='*IT'
@@ -166,6 +178,9 @@ jobs:
           java-version: '17'
           cache: maven
           cache-dependency-path: java-app/pom.xml
+      - name: Make mvnw executable
+        working-directory: java-app
+        run: chmod +x ./mvnw
 
       - name: Build jar (no tests)
         working-directory: java-app
