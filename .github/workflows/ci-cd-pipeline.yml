@@ -39,11 +39,11 @@ jobs:
   build:
     uses: ./.github/workflows/_reusable-build.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
-      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-      ecr-repository: ${{ env.ECR_REPOSITORY }}
-      image-tag: ${{ env.IMAGE_TAG }}
-      aws-region: ${{ env.AWS_REGION }}
+      java-version: '17'
+      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+      ecr-repository: spring-boot-app
+      image-tag: ${{ github.sha }}
+      aws-region: us-east-1
       aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
@@ -53,26 +53,26 @@ jobs:
     needs: build
     uses: ./.github/workflows/_reusable-unit-tests.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
 
   integration-tests:
     needs: build
     uses: ./.github/workflows/_reusable-integration-tests.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
 
   sonarqube-scan:
     needs: build
     uses: ./.github/workflows/_reusable-sonarqube.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
     secrets: inherit
 
   dependency-scan:
     needs: build
     uses: ./.github/workflows/_reusable-dependency-scan.yml
     with:
-      java-version: ${{ env.JAVA_VERSION }}
+      java-version: '17'
 
   # ---------------------------------------------------------------------------
   # Stage 3: Push image to ECR (push events only, not PRs)
@@ -82,10 +82,10 @@ jobs:
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
     uses: ./.github/workflows/_reusable-push-ecr.yml
     with:
-      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-      ecr-repository: ${{ env.ECR_REPOSITORY }}
-      image-tag: ${{ env.IMAGE_TAG }}
-      aws-region: ${{ env.AWS_REGION }}
+      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+      ecr-repository: spring-boot-app
+      image-tag: ${{ github.sha }}
+      aws-region: us-east-1
       aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
 
   # ---------------------------------------------------------------------------
@@ -97,14 +97,14 @@ jobs:
     uses: ./.github/workflows/_reusable-deploy.yml
     with:
       environment: dev
-      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-      ecr-repository: ${{ env.ECR_REPOSITORY }}
-      image-tag: ${{ env.IMAGE_TAG }}
-      aws-region: ${{ env.AWS_REGION }}
+      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+      ecr-repository: spring-boot-app
+      image-tag: ${{ github.sha }}
+      aws-region: us-east-1
       aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
       cluster-name: ${{ vars.DEPLOY_DEV_CLUSTER }}
       namespace: spring-boot-app-dev
-      values-file: ${{ env.HELM_CHART_PATH }}/values-dev.yaml
+      values-file: ./charts/spring-boot-app/values-dev.yaml
       smoke-test-scheme: http
       timeout-minutes: 10
     secrets: inherit
@@ -118,14 +118,14 @@ jobs:
     uses: ./.github/workflows/_reusable-deploy.yml
     with:
       environment: prod
-      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-      ecr-repository: ${{ env.ECR_REPOSITORY }}
-      image-tag: ${{ env.IMAGE_TAG }}
-      aws-region: ${{ env.AWS_REGION }}
+      ecr-registry: ${{ vars.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+      ecr-repository: spring-boot-app
+      image-tag: ${{ github.sha }}
+      aws-region: us-east-1
       aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
       cluster-name: ${{ vars.DEPLOY_PROD_CLUSTER }}
       namespace: spring-boot-app-prod
-      values-file: ${{ env.HELM_CHART_PATH }}/values-prod.yaml
+      values-file: ./charts/spring-boot-app/values-prod.yaml
       smoke-test-scheme: https
       smoke-test-host: app.example.com
       blue-green: true
@@ -141,7 +141,7 @@ jobs:
     if: always() && needs.deploy-prod.result == 'success'
     uses: ./.github/workflows/_reusable-rollback.yml
     with:
-      aws-region: ${{ env.AWS_REGION }}
+      aws-region: us-east-1
       aws-account-id: ${{ vars.AWS_ACCOUNT_ID }}
       cluster-name: ${{ vars.DEPLOY_PROD_CLUSTER }}
       namespace: spring-boot-app-prod
