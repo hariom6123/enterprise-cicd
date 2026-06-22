@@ -1,0 +1,73 @@
+name: Reusable — Integration Tests
+
+# Internal reusable workflow — Failsafe + Postgres + Redis service containers.
+# Callers use:
+#   jobs:
+#     integration-tests:
+#       uses: ./.github/workflows/_reusable-integration-tests.yml
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version to install.'
+        type: string
+        default: '17'
+
+jobs:
+  integration-tests:
+    name: 🔗 Integration Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: testpass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: --health-cmd "redis-cli ping"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☕ Setup Java ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: 🔗 Run Integration Tests
+        run: |
+          mvn -B -ntp verify \
+            -Dtest='*IT' \
+            -DfailIfNoTests=false \
+            -Dspring.profiles.active=test \
+            -Dpostgres.host=localhost \
+            -Dredis.host=localhost
+        env:
+          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/testdb
+          SPRING_DATASOURCE_USERNAME: test
+          SPRING_DATASOURCE_PASSWORD: testpass
+          SPRING_REDIS_HOST: localhost
+          SPRING_REDIS_PORT: 6379
+
+      - name: 📊 Publish IT Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failsafe-reports
+          path: '**/target/failsafe-reports/*.xml'
+          retention-days: 14

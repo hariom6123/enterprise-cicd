@@ -1,0 +1,49 @@
+name: Reusable — OWASP Dependency Check
+
+# Internal reusable workflow — OWASP dependency-check (fail on CVSS ≥ 7).
+# Callers use:
+#   jobs:
+#     dependency-scan:
+#       uses: ./.github/workflows/_reusable-dependency-scan.yml
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version to install.'
+        type: string
+        default: '17'
+      fail-build-on-cvss:
+        description: 'CVSS score at which the build should fail.'
+        type: number
+        default: 7
+
+jobs:
+  dependency-scan:
+    name: 📚 Dependency Scan (OWASP)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☕ Setup Java ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: 🔒 OWASP Dependency Check
+        run: |
+          mvn -B -ntp org.owasp:dependency-check-maven:12.1.1:check \
+            -DfailBuildOnCVSS=${{ inputs.fail-build-on-cvss }} \
+            -DassemblyAnalyzerEnabled=false
+
+      - name: 📊 Upload Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-report
+          path: 'target/dependency-check-report.html'
+          retention-days: 30

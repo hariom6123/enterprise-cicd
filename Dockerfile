@@ -4,7 +4,7 @@
 # ====================================
 
 # ---- Build Stage ----
-FROM eclipse-temurin:21-jdk-jammy AS builder
+FROM eclipse-temurin:17-jdk-jammy AS builder
 WORKDIR /build
 
 # Copy Maven files first (better caching)
@@ -27,7 +27,7 @@ RUN mkdir -p extracted && \
     java -Djarmode=layertools -jar target/*.jar extract --destination extracted
 
 # ---- Runtime Stage ----
-FROM eclipse-temurin:21-jre-jammy AS runtime
+FROM eclipse-temurin:17-jre-jammy AS runtime
 
 # Metadata
 LABEL org.opencontainers.image.title="Spring Boot App" \

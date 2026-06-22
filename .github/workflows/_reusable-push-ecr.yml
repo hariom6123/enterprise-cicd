@@ -1,0 +1,136 @@
+name: Reusable — Push to ECR
+
+# Internal reusable workflow — downloads the JAR artifact, builds the image,
+# pushes it to ECR, runs ECR's native scan + Trivy final scan, fails on CRITICAL.
+#
+# Callers use:
+#   jobs:
+#     push-to-ecr:
+#       uses: ./.github/workflows/_reusable-push-ecr.yml
+#       with:
+#         ecr-registry: ...
+#         ecr-repository: ...
+#         image-tag: ...
+#         aws-region: ...
+#         aws-account-id: ...
+
+on:
+  workflow_call:
+    inputs:
+      ecr-registry:
+        description: 'ECR registry URL (without trailing slash).'
+        type: string
+        required: true
+      ecr-repository:
+        description: 'ECR repository name.'
+        type: string
+        required: true
+      image-tag:
+        description: 'Image tag (typically github.sha).'
+        type: string
+        required: true
+      aws-region:
+        description: 'AWS region.'
+        type: string
+        required: true
+      aws-account-id:
+        description: 'AWS account id (used to build the OIDC role ARN).'
+        type: string
+        required: true
+
+jobs:
+  push-to-ecr:
+    name: 📤 Push to ECR
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: dev
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+
+    steps:
+      - name: 📥 Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: target/
+
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-push-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: 🔑 Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🐳 Build & Push to ECR
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          ecr-registry: ${{ steps.login-ecr.outputs.registry }}
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr-repository }}:latest
+          cache-from: type=gha,scope=build-cache
+          cache-to: type=gha,scope=build-cache,mode=max
+          provenance: true
+          sbom: true
+
+      - name: 🔍 ECR Image Scan (Push phase)
+        run: |
+          aws ecr start-image-scan \
+            --repository-name ${{ inputs.ecr-repository }} \
+            --image-id imageTag=${{ inputs.image-tag }} \
+            --region ${{ inputs.aws-region }}
+
+      - name: ⏳ Wait for ECR Scan
+        run: |
+          echo "Waiting for ECR scan to complete..."
+          aws ecr wait image-scan-complete \
+            --repository-name ${{ inputs.ecr-repository }} \
+            --image-id imageTag=${{ inputs.image-tag }} \
+            --region ${{ inputs.aws-region }} || true
+
+      - name: 📊 Get Scan Results
+        run: |
+          SCAN_FINDINGS=$(aws ecr describe-image-scan-findings \
+            --repository-name ${{ inputs.ecr-repository }} \
+            --image-id imageTag=${{ inputs.image-tag }} \
+            --region ${{ inputs.aws-region }} \
+            --query 'imageScanFindings.findingSeverityCounts' \
+            --output text || echo "none")
+
+          echo "ECR scan findings: $SCAN_FINDINGS"
+          echo "ECR_SCAN=$SCAN_FINDINGS" >> $GITHUB_ENV
+
+          if echo "$SCAN_FINDINGS" | grep -q "CRITICAL"; then
+            echo "::error::❌ Critical vulnerabilities found in image"
+            exit 1
+          fi
+
+      - name: 🔒 Trivy Final Scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-final-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+        continue-on-error: false
+
+      - name: 📊 Upload Final Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-final-results.sarif'
+          category: trivy-final

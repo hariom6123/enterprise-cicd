@@ -1,13 +1,13 @@
 # spring-boot-app
 
-Java 21 / Spring Boot 3.x reference application wired to the enterprise CI/CD
+Java 17 / Spring Boot 3.x reference application wired to the enterprise CI/CD
 pipeline (`ci-cd-pipeline.yml`) at the repo root.
 
 ## Stack
 
 | Layer        | Choice                                     |
 |--------------|--------------------------------------------|
-| Runtime      | Java 21 (Temurin)                          |
+| Runtime      | Java 17 (Temurin)                          |
 | Framework    | Spring Boot 3.3.x (web, data-jpa, data-redis, actuator, validation) |
 | Build        | Maven (wrapper: `./mvnw`)                 |
 | Database     | PostgreSQL (prod), H2 in-memory (`test`)   |
@@ -86,7 +86,7 @@ resulting fat jar has a real (non-SNAPSHOT) version baked into its MANIFEST.
 ## Run locally
 
 ```bash
-# dev profile (H2 + localhost Redis defaults; you only need Java 21)
+# dev profile (H2 + localhost Redis defaults; you only need Java 17)
 ./mvnw -B -ntp spring-boot:run
 ```
 
@@ -105,8 +105,8 @@ java -jar target/spring-boot-app.jar
 
 The multi-stage `Dockerfile` (at the repo root) builds the runtime image:
 
-1. `eclipse-temurin:21-jdk-jammy` — runs `./mvnw clean package`
-2. `eclipse-temurin:21-jre-jammy` — copies the extracted Spring Boot layers,
+1. `eclipse-temurin:17-jdk-jammy` — runs `./mvnw clean package`
+2. `eclipse-temurin:17-jre-jammy` — copies the extracted Spring Boot layers,
    runs as `spring:spring` (uid 10001), entrypoint `tini --` + `JarLauncher`
 
 The container's `HEALTHCHECK` hits `/actuator/health/liveness`, which is what

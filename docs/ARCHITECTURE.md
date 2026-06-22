@@ -110,7 +110,7 @@ spring-boot-app/
 - **Duration:** ~5-8 minutes
 - **Steps:**
   1. Checkout code (with LFS, full history for SonarQube)
-  2. Setup Java 21 (Temurin) with Maven cache
+  2. Setup Java 17 (Temurin) with Maven cache
   3. Maven build (skip tests — runs in test stage)
   4. Upload JAR artifact (30-day retention)
   5. Setup Docker Buildx with GHA cache
