@@ -16,22 +16,31 @@ public class CounterService {
     private static final String KEY = "app:counter:visits";
 
     private final StringRedisTemplate redis;
-    private final ValueOperations<String, String> ops;
 
     public CounterService(StringRedisTemplate redis) {
         this.redis = redis;
-        // Cache the ValueOperations proxy once — the lookup is cheap but
-        // called on every read/write of a counter that's polled.
-        this.ops = redis.opsForValue();
+    }
+
+    // Look up ValueOperations lazily on every call rather than caching it
+    // in the constructor. Reasons:
+    //   1. Lets unit tests stub redis.opsForValue() before any call site
+    //      uses it — @InjectMocks would otherwise instantiate the service
+    //      with a null proxy.
+    //   2. The ValueOperations proxy is internally tied to the
+    //      StringRedisTemplate's connection factory; caching it across
+    //      reconnects (e.g. after a Redis failover) can return a stale
+    //      proxy. The lookup is cheap.
+    private ValueOperations<String, String> ops() {
+        return redis.opsForValue();
     }
 
     public long increment() {
-        Long value = ops.increment(KEY);
+        Long value = ops().increment(KEY);
         return value == null ? 0L : value;
     }
 
     public long current() {
-        String value = ops.get(KEY);
+        String value = ops().get(KEY);
         return value == null ? 0L : Long.parseLong(value);
     }
 
