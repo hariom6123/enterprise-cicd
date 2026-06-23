@@ -45,3 +45,5 @@ jobs:
     uses: ./.github/workflows/_reusable-dependency-scan.yml
     with:
       java-version: ${{ vars.JAVA_VERSION }}
+    secrets:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}

@@ -17,12 +17,19 @@ on:
         description: 'CVSS score at which the build should fail.'
         type: number
         default: 7
+    secrets:
+      NVD_API_KEY:
+        description: 'NVD API key — dramatically speeds up the first-run CVE feed download. Optional but strongly recommended.'
+        required: false
 
 jobs:
   dependency-scan:
     name: 📚 Dependency Scan (OWASP)
     runs-on: ubuntu-22.04
-    timeout-minutes: 10
+    # First run downloads the full NVD feed (~360k records, ~250 MB) and
+    # can take 20+ minutes even with an API key. Subsequent runs hit the
+    # cache and finish in seconds.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -38,18 +45,28 @@ jobs:
       # doesn't redownload it on every run. Without an NVD API key the feed
       # download is rate-limited to ~5 req / 30s and can take 30+ minutes,
       # which exceeds the job timeout. First run still seeds the cache.
+      # The cache key includes the plugin version so an upgrade of
+      # dependency-check-maven doesn't try to read a stale data layout.
       - name: 📦 Cache NVD CVE feed
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository/org/owasp/dependency-check-data
-          key: nvd-feed-${{ hashFiles('java-app/pom.xml') }}
+          key: nvd-feed-12.1.1-${{ hashFiles('java-app/pom.xml') }}
           restore-keys: nvd-feed-
 
       - name: 🔒 OWASP Dependency Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
+          NVD_ARGS=""
+          if [ -n "$NVD_API_KEY" ]; then
+            NVD_ARGS="-DnvdApiKey=$NVD_API_KEY"
+          fi
+
           mvn -B -ntp org.owasp:dependency-check-maven:12.1.1:check \
             -DfailBuildOnCVSS=${{ inputs.fail-build-on-cvss }} \
-            -DassemblyAnalyzerEnabled=false
+            -DassemblyAnalyzerEnabled=false \
+            $NVD_ARGS
 
       - name: 📊 Upload Reports
         if: always()
