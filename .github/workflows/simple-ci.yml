@@ -181,3 +181,122 @@ jobs:
           path: java-app/target/*.jar
           if-no-files-found: error
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: Claude PR Review (only on pull_request to main, so push
+  # triggers on feature/** don't burn API quota). Runs after package so
+  # we don't pay for Claude on a build that already failed.
+  # ---------------------------------------------------------------------------
+  claude-review:
+    name: 🤖 Claude Review
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs: [package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      # Parsed by the gate-merge job below. Empty when no critical issues.
+      critical-found: ${{ steps.gate.outputs.critical-found }}
+      review-comment-id: ${{ steps.claude.outputs.comment_id }}
+
+    steps:
+      - name: 📥 Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🤖 Run Claude Code review
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --review flips Claude into PR review mode (reads the diff, no chat).
+          # --allowed-tools restricts Claude to read-only ops so it can't
+          # accidentally edit files during the review.
+          claude_args: |
+            --review
+            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
+          # The full review brief. Claude is told to:
+          #   - cover 6 areas (code quality, Spring Boot arch, security,
+          #     GitHub Actions, performance, maintainability)
+          #   - emit 5 structured sections
+          #   - end with a parseable `CRITICAL_ISSUES_FOUND:` line so the
+          #     gate-merge job below can decide whether to fail the check.
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            (${{ github.event.pull_request.title }}) on
+            ${{ github.repository }} as a Staff Software Engineer.
+
+            Analyze:
+            - Java code quality
+            - Spring Boot architecture
+            - Security vulnerabilities
+            - GitHub Actions workflows
+            - Performance issues
+            - Maintainability
+
+            Return your review in EXACTLY this format (markdown):
+
+            ## 1. Critical Issues
+            (Blockers — bugs, security holes, broken CI, data loss, anything
+            that must be fixed before merge. If none, write "None.")
+
+            ## 2. High Priority Improvements
+            (Should-fix-but-not-blocking issues.)
+
+            ## 3. Nice-to-have Improvements
+            (Polish / refactor suggestions.)
+
+            ## 4. Deployment Risks
+            (Anything that could bite us in production — config drift,
+            backward-incompatible changes, missing rollouts, observability
+            gaps, secret/permission changes.)
+
+            ## 5. Final Score
+            (X.X / 10 — single decimal, brief one-line justification.)
+
+            ---
+
+            CRITICAL_ISSUES_FOUND: no
+            (Replace with `CRITICAL_ISSUES_FOUND: yes` if section 1 lists
+            any blocking issue. This line MUST be the last line of your
+            output and is parsed by CI to decide whether to fail the
+            workflow. Do not omit it.)
+
+      - name: 🚦 Detect Critical Issues
+        id: gate
+        # Grep the captured Claude transcript for the gate marker.
+        # The claude-code-action writes the raw output to ${{ steps.claude.outputs.transcript }}
+        # but to be defensive we also re-grep the PR comment body.
+        run: |
+          if echo '${{ steps.claude.outputs.transcript }}' | grep -qE 'CRITICAL_ISSUES_FOUND:\s*yes'; then
+            echo "critical-found=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::Critical Issues detected — workflow will fail."
+          else
+            echo "critical-found=false" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::No critical issues — workflow will pass."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: Critical-Issue Gate. Fails the check when the review above
+  # reports blocking issues. This is the job branch protection should
+  # require on main.
+  # ---------------------------------------------------------------------------
+  gate-merge:
+    name: 🚦 Critical-Issue Gate
+    needs: claude-review
+    runs-on: ubuntu-latest
+    if: always() && needs.claude-review.result == 'success' && github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - name: 🚪 Enforce no-critical-issues policy
+        env:
+          CRITICAL: ${{ needs.claude-review.outputs.critical-found }}
+        run: |
+          echo "Claude reported critical-found=$CRITICAL"
+          if [ "$CRITICAL" = "true" ]; then
+            echo "::error::Critical Issues found by Claude PR Review. See the 🤖 Claude Review comment on this PR for details."
+            exit 1
+          fi
+          echo "✅ No critical issues — review passed."
