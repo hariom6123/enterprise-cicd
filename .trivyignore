@@ -1,0 +1,29 @@
+# Trivy ignore file
+# Docs: https://aquasecurity.github.io/trivy/v0.55/docs/suppression/
+#
+# Format (one per line):
+#   # ID       expiry_date   reason
+# Lines starting with `#` are comments.
+# Leave the expiry blank for a permanent ignore (not recommended).
+#
+# Why this file exists:
+#   gcr.io/distroless/java17-debian12:nonroot ships with a small set of
+#   known CRITICAL/HIGH findings in its Debian base libraries and OpenJDK
+#   package. Debian's security team is responsible for the fixes — we
+#   can't patch them in the image. Each entry below has a fixed expiry
+#   so we re-evaluate it when the ignore window passes.
+#
+# How to update:
+#   1. Run `trivy image gcr.io/distroless/java17-debian12:nonroot` locally
+#   2. For anything still present, check upstream status (Debian security
+#      tracker, distroless GitHub issues)
+#   3. If still unfixed, renew the expiry + reason; if fixed, delete the line
+
+# OpenJDK 17 CVE — fixed upstream, awaiting Debian package rebuild.
+# Upstream: https://openjdk.org/groups/vulnerability/advisories/2025-04-15
+# Distroless tracker: https://github.com/GoogleContainerTools/distroless/issues/1789
+CVE-2025-21587  2026-12-31  OpenJDK 17: awaiting Debian package rebuild
+
+# zlib1g — Debian marked will_not_fix for the bookworm release.
+# Tracked in distroless issue #1762.
+CVE-2023-45853  2026-12-31  zlib1g: Debian will_not_fix for bookworm; not exploitable via JRE

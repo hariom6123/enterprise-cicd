@@ -1,0 +1,304 @@
+name: Reusable — Deploy to EKS
+
+# Internal reusable workflow — Helm deploy to dev OR prod EKS.
+# Both environments used to have ~100 lines of near-identical YAML; now they
+# share this single workflow and differ only via the inputs below.
+#
+# Example (dev):
+#   jobs:
+#     deploy-dev:
+#       uses: ./.github/workflows/_reusable-deploy.yml
+#       with:
+#         environment: dev
+#         ecr-registry: ...
+#         ecr-repository: spring-boot-app
+#         image-tag: ...
+#         aws-region: us-east-1
+#         aws-account-id: ...
+#         cluster-name: dev-eks
+#         namespace: spring-boot-app-dev
+#         values-file: ./charts/spring-boot-app/values-dev.yaml
+#         smoke-test-scheme: http
+#       secrets: inherit
+#
+# Example (prod) — same workflow, blue-green + https + manual approval env:
+#   jobs:
+#     deploy-prod:
+#       uses: ./.github/workflows/_reusable-deploy.yml
+#       with:
+#         environment: prod
+#         ...
+#         values-file: ./charts/spring-boot-app/values-prod.yaml
+#         smoke-test-scheme: https
+#         app-url: https://app.example.com
+#         blue-green: true
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment — "dev" or "prod".'
+        type: string
+        required: true
+      ecr-registry:
+        description: 'ECR registry URL.'
+        type: string
+        required: true
+      ecr-repository:
+        description: 'ECR repository name.'
+        type: string
+        required: true
+      image-tag:
+        description: 'Image tag to deploy.'
+        type: string
+        required: true
+      aws-region:
+        description: 'AWS region.'
+        type: string
+        required: true
+      aws-account-id:
+        description: 'AWS account id.'
+        type: string
+        required: true
+      cluster-name:
+        description: 'EKS cluster name (passed to aws eks update-kubeconfig).'
+        type: string
+        required: true
+      namespace:
+        description: 'Kubernetes namespace to deploy into.'
+        type: string
+        required: true
+      values-file:
+        description: 'Helm values file (relative to repo root).'
+        type: string
+        required: true
+      helm-release:
+        description: 'Helm release name.'
+        type: string
+        default: 'spring-boot-app'
+      smoke-test-scheme:
+        description: 'Scheme used by smoke tests ("http" or "https").'
+        type: string
+        required: false
+        default: http
+      smoke-test-host:
+        description: 'Override the smoke-test host. Defaults to the cluster service DNS.'
+        type: string
+        required: false
+        default: ''
+      blue-green:
+        description: 'Enable blue-green Helm strategy (prod).'
+        type: boolean
+        default: false
+      timeout-minutes:
+        description: 'Helm --timeout value (minutes).'
+        type: number
+        default: 10
+      app-url:
+        description: 'Public app URL — included in prod Slack messages.'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  deploy:
+    name: 🚀 Deploy to ${{ inputs.environment == 'prod' && 'Prod' || 'Dev' }} EKS
+    runs-on: ubuntu-22.04
+    timeout-minutes: ${{ inputs.environment == 'prod' && 30 || 20 }}
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-deploy-${{ inputs.environment }}-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: ⚙️ Update kubeconfig for ${{ inputs.environment }}
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ inputs.cluster-name }} \
+            --region ${{ inputs.aws-region }} \
+            --alias ${{ inputs.environment }}
+
+      - name: 📊 Cluster Info
+        if: inputs.environment == 'dev'
+        run: |
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: ⛵ Pre-flight Checks
+        if: inputs.environment == 'prod'
+        run: |
+          kubectl cluster-info
+          kubectl get deployment ${{ inputs.helm-release }} -n ${{ inputs.namespace }} || echo "First deployment"
+          echo "Current image:"
+          kubectl get deployment ${{ inputs.helm-release }} -n ${{ inputs.namespace }} \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "N/A"
+          echo "Deploying image: ${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}:${{ inputs.image-tag }}"
+
+      - name: ⛵ Helm template (validate manifests)
+        id: helm-template
+        run: |
+          EXTRA_SET=""
+          if [ "${{ inputs.blue-green }}" = "true" ]; then
+            EXTRA_SET="--set blueGreen.enabled=true --set blueGreen.currentColor=blue"
+          fi
+
+          helm template ${{ inputs.helm-release }} \
+            ${{ inputs.values-file }} \
+            --set image.tag=${{ inputs.image-tag }} \
+            --set image.repository=${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }} \
+            $EXTRA_SET \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            > /tmp/manifests.yaml
+
+          echo "✅ Manifest validation passed"
+
+      - name: ⛵ Helm Install/Upgrade
+        run: |
+          EXTRA_SET=""
+          if [ "${{ inputs.blue-green }}" = "true" ]; then
+            EXTRA_SET="--set blueGreen.enabled=true --set blueGreen.currentColor=blue"
+          fi
+
+          helm upgrade --install ${{ inputs.helm-release }} \
+            ${{ inputs.values-file }} \
+            --set image.tag=${{ inputs.image-tag }} \
+            --set image.repository=${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }} \
+            $EXTRA_SET \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            --wait \
+            --timeout ${{ inputs.timeout-minutes }}m \
+            --atomic \
+            --history-max ${{ inputs.environment == 'prod' && 10 || 5 }}
+
+      - name: ✅ Verify Deployment
+        run: |
+          kubectl rollout status deployment/${{ inputs.helm-release }} -n ${{ inputs.namespace }} \
+            --timeout=${{ inputs.timeout-minutes }}m
+
+          echo "=== Pod Status ==="
+          kubectl get pods -n ${{ inputs.namespace }} -l app.kubernetes.io/name=${{ inputs.helm-release }} -o wide
+
+          READY_PODS=$(kubectl get pods -n ${{ inputs.namespace }} \
+            -l app.kubernetes.io/name=${{ inputs.helm-release }} \
+            -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' \
+            | tr ' ' '\n' | grep -c "True" || echo "0")
+
+          TOTAL_PODS=$(kubectl get pods -n ${{ inputs.namespace }} \
+            -l app.kubernetes.io/name=${{ inputs.helm-release }} \
+            --no-headers | wc -l)
+
+          echo "Ready: $READY_PODS/$TOTAL_PODS"
+
+          if [ "$READY_PODS" -ne "$TOTAL_PODS" ]; then
+            echo "::error::❌ Not all pods are ready"
+            exit 1
+          fi
+
+      - name: 🔍 Get Service Endpoint
+        id: service
+        run: |
+          if [ -n "${{ inputs.smoke-test-host }}" ]; then
+            ENDPOINT="${{ inputs.smoke-test-host }}"
+          else
+            ENDPOINT=$(kubectl get svc ${{ inputs.helm-release }} -n ${{ inputs.namespace }} \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -z "$ENDPOINT" ]; then
+              ENDPOINT="${{ inputs.helm-release }}.${{ inputs.namespace }}.svc.cluster.local"
+            fi
+          fi
+          echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+          echo "service_url=${{ inputs.smoke-test-scheme }}://$ENDPOINT" >> $GITHUB_OUTPUT
+
+      - name: 🩺 Smoke Tests
+        run: |
+          ENDPOINT=${{ steps.service.outputs.endpoint }}
+          SCHEME=${{ inputs.smoke-test-scheme }}
+          echo "Running smoke tests against: ${SCHEME}://${ENDPOINT}"
+
+          MAX_ATTEMPTS=$([ "${{ inputs.environment }}" = "prod" ] && echo 20 || echo 30)
+          SLEEP_SECS=$([ "${{ inputs.environment }}" = "prod" ] && echo 15 || echo 10)
+
+          for i in $(seq 1 ${MAX_ATTEMPTS}); do
+            if [ "${SCHEME}" = "https" ]; then
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 10 https://${ENDPOINT}/actuator/health/liveness)
+            else
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -m 5 http://${ENDPOINT}/actuator/health/liveness)
+            fi
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Liveness check passed (attempt $i)"
+              break
+            fi
+            if [ $i -eq ${MAX_ATTEMPTS} ]; then
+              echo "::error::❌ Health check failed after ${MAX_ATTEMPTS} attempts. Status: ${HTTP_STATUS}"
+              exit 1
+            fi
+            sleep ${SLEEP_SECS}
+          done
+
+          if [ "${SCHEME}" = "https" ]; then
+            curl -sf -m 10 https://${ENDPOINT}/actuator/health | jq .
+            curl -sf -m 10 https://${ENDPOINT}/actuator/info
+          else
+            curl -sf -m 5 http://${ENDPOINT}/actuator/health/readiness
+            curl -sf -m 10 http://${ENDPOINT}/actuator/health | jq .
+            curl -sf -m 10 http://${ENDPOINT}/actuator/info
+          fi
+
+      - name: 🧪 Run E2E Smoke Tests
+        if: inputs.environment == 'dev'
+        run: |
+          ENDPOINT=${{ steps.service.outputs.endpoint }}
+          newman run tests/smoke/smoke-test-collection.json \
+            --env-var "baseUrl=http://${ENDPOINT}" \
+            --reporters cli,junit \
+            --reporter-junit-export /tmp/newman-results.xml || true
+
+      - name: 📊 Publish E2E Results
+        if: always() && inputs.environment == 'dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: /tmp/newman-results.xml
+          retention-days: 14
+
+      - name: 💬 Slack notification (success)
+        if: success() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: ./.github/actions/slack-notify
+        with:
+          status: success
+          environment: ${{ inputs.environment }}
+          image-tag: ${{ inputs.image-tag }}
+          commit-sha: ${{ github.sha }}
+          author: ${{ github.actor }}
+          run-id: ${{ github.run_id }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          app-url: ${{ inputs.app-url }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: 💬 Slack notification (failure)
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: ./.github/actions/slack-notify
+        with:
+          status: failure
+          environment: ${{ inputs.environment }}
+          image-tag: ${{ inputs.image-tag }}
+          commit-sha: ${{ github.sha }}
+          author: ${{ github.actor }}
+          run-id: ${{ github.run_id }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          app-url: ${{ inputs.app-url }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

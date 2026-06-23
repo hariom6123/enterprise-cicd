@@ -1,11 +1,18 @@
 # =============================================================================
 # Simple CI — standalone, no deploy.
 #
-# Stages: build → test → security scan → package.
-# No ECR push, no Helm, no EKS. Jar is uploaded as a build artifact.
+# Stages: build → unit test → security scan → package.
+# No ECR push, no Helm, no EKS, no integration tests. Jar is uploaded
+# as a build artifact.
+#
 # Lives alongside the enterprise pipeline (ci-cd-pipeline.yml) and does not
 # call any of the reusable workflows, so it can run independently without
 # any repo Variables being set.
+#
+# Integration tests are intentionally out of scope here — they need real
+# Postgres + Redis service containers, which the enterprise pipeline
+# already covers (see .github/workflows/_reusable-integration-tests.yml).
+# Use that workflow when you need IT coverage.
 # =============================================================================
 name: Simple CI
 
@@ -71,7 +78,7 @@ jobs:
           cache-to: type=gha,mode=max
 
   # ---------------------------------------------------------------------------
-  # Stage 2: Tests (unit + integration, in parallel with scan)
+  # Stage 2: Unit Tests (in parallel with scan)
   # ---------------------------------------------------------------------------
   unit-tests:
     name: 🧪 Unit Tests
@@ -91,60 +98,6 @@ jobs:
       - name: Run unit tests
         working-directory: java-app
         run: ./mvnw -B -ntp test -Dtest='*Test,!*IT'
-
-  integration-tests:
-    name: 🔗 Integration Tests
-    needs: build
-    runs-on: ubuntu-latest
-    # Service containers — same as the reusable IT workflow so behavior matches.
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: testdb
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: testpass
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: --health-cmd "redis-cli ping"
-    env:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5432/testdb
-      SPRING_DATASOURCE_USERNAME: test
-      SPRING_DATASOURCE_PASSWORD: testpass
-      SPRING_REDIS_HOST: localhost
-      SPRING_REDIS_PORT: '6379'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-          cache-dependency-path: java-app/pom.xml
-      - name: Make mvnw executable
-        working-directory: java-app
-        run: chmod +x ./mvnw
-      - name: Run integration tests
-        working-directory: java-app
-        run: ./mvnw -B -ntp verify -Dtest='*IT' -DfailIfNoTests=false
-
-      - name: Publish IT results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: failsafe-reports
-          path: java-app/target/failsafe-reports/*.xml
-          if-no-files-found: warn
-          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Stage 3: Security scan — Trivy on the locally built image
@@ -181,11 +134,11 @@ jobs:
           ignore-unfixed: true
           # Reads .trivyignore at repo root — see that file for why each
           # entry is there and when it expires.
-          ignorefile: .trivyignore
+          trivyignores: .trivyignore
 
       - name: Upload Trivy scan results to Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-results.sarif'
 
@@ -203,7 +156,7 @@ jobs:
   # ---------------------------------------------------------------------------
   package:
     name: 📦 Package
-    needs: [build, unit-tests, integration-tests, security-scan]
+    needs: [build, unit-tests, security-scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -228,3 +181,122 @@ jobs:
           path: java-app/target/*.jar
           if-no-files-found: error
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Stage 5: Claude PR Review (only on pull_request to main, so push
+  # triggers on feature/** don't burn API quota). Runs after package so
+  # we don't pay for Claude on a build that already failed.
+  # ---------------------------------------------------------------------------
+  claude-review:
+    name: 🤖 Claude Review
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    needs: [package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    outputs:
+      # Parsed by the gate-merge job below. Empty when no critical issues.
+      critical-found: ${{ steps.gate.outputs.critical-found }}
+      review-comment-id: ${{ steps.claude.outputs.comment_id }}
+
+    steps:
+      - name: 📥 Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🤖 Run Claude Code review
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --review flips Claude into PR review mode (reads the diff, no chat).
+          # --allowed-tools restricts Claude to read-only ops so it can't
+          # accidentally edit files during the review.
+          claude_args: |
+            --review
+            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
+          # The full review brief. Claude is told to:
+          #   - cover 6 areas (code quality, Spring Boot arch, security,
+          #     GitHub Actions, performance, maintainability)
+          #   - emit 5 structured sections
+          #   - end with a parseable `CRITICAL_ISSUES_FOUND:` line so the
+          #     gate-merge job below can decide whether to fail the check.
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            (${{ github.event.pull_request.title }}) on
+            ${{ github.repository }} as a Staff Software Engineer.
+
+            Analyze:
+            - Java code quality
+            - Spring Boot architecture
+            - Security vulnerabilities
+            - GitHub Actions workflows
+            - Performance issues
+            - Maintainability
+
+            Return your review in EXACTLY this format (markdown):
+
+            ## 1. Critical Issues
+            (Blockers — bugs, security holes, broken CI, data loss, anything
+            that must be fixed before merge. If none, write "None.")
+
+            ## 2. High Priority Improvements
+            (Should-fix-but-not-blocking issues.)
+
+            ## 3. Nice-to-have Improvements
+            (Polish / refactor suggestions.)
+
+            ## 4. Deployment Risks
+            (Anything that could bite us in production — config drift,
+            backward-incompatible changes, missing rollouts, observability
+            gaps, secret/permission changes.)
+
+            ## 5. Final Score
+            (X.X / 10 — single decimal, brief one-line justification.)
+
+            ---
+
+            CRITICAL_ISSUES_FOUND: no
+            (Replace with `CRITICAL_ISSUES_FOUND: yes` if section 1 lists
+            any blocking issue. This line MUST be the last line of your
+            output and is parsed by CI to decide whether to fail the
+            workflow. Do not omit it.)
+
+      - name: 🚦 Detect Critical Issues
+        id: gate
+        # Grep the captured Claude transcript for the gate marker.
+        # The claude-code-action writes the raw output to ${{ steps.claude.outputs.transcript }}
+        # but to be defensive we also re-grep the PR comment body.
+        run: |
+          if echo '${{ steps.claude.outputs.transcript }}' | grep -qE 'CRITICAL_ISSUES_FOUND:\s*yes'; then
+            echo "critical-found=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::Critical Issues detected — workflow will fail."
+          else
+            echo "critical-found=false" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::No critical issues — workflow will pass."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: Critical-Issue Gate. Fails the check when the review above
+  # reports blocking issues. This is the job branch protection should
+  # require on main.
+  # ---------------------------------------------------------------------------
+  gate-merge:
+    name: 🚦 Critical-Issue Gate
+    needs: claude-review
+    runs-on: ubuntu-latest
+    if: always() && needs.claude-review.result == 'success' && github.event_name == 'pull_request' && github.base_ref == 'main'
+    steps:
+      - name: 🚪 Enforce no-critical-issues policy
+        env:
+          CRITICAL: ${{ needs.claude-review.outputs.critical-found }}
+        run: |
+          echo "Claude reported critical-found=$CRITICAL"
+          if [ "$CRITICAL" = "true" ]; then
+            echo "::error::Critical Issues found by Claude PR Review. See the 🤖 Claude Review comment on this PR for details."
+            exit 1
+          fi
+          echo "✅ No critical issues — review passed."

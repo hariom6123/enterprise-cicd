@@ -1,0 +1,151 @@
+# =============================================================================
+# Slack Notify — composite action
+#
+# Replaces the three inline slackapi/slack-github-action invocations that
+# previously lived in deploy-dev (success/failure) and deploy-prod (success).
+# Picks the right header text/emoji based on (status, environment) and adds
+# environment-specific fields like the app URL for prod.
+#
+# Required inputs: status, environment, image-tag, commit-sha, author,
+#                  run-id, run-url
+# Optional inputs: service (default spring-boot-app), app-url (prod only)
+#
+# Required secret: SLACK_WEBHOOK_URL
+# =============================================================================
+name: Slack Notify
+
+description: Posts a deployment status message to Slack. Maps status × environment to the right header text and emoji.
+
+inputs:
+  status:
+    description: 'Outcome of the job — "success" or "failure".'
+    required: true
+  environment:
+    description: 'Target environment — "dev" or "prod".'
+    required: true
+  service:
+    description: 'Service name (shown in Slack message).'
+    required: false
+    default: 'spring-boot-app'
+  image-tag:
+    description: 'Image tag that was (or would have been) deployed.'
+    required: true
+  commit-sha:
+    description: 'Git commit SHA being deployed.'
+    required: true
+  author:
+    description: 'GitHub actor who triggered the deploy.'
+    required: true
+  run-id:
+    description: 'GitHub Actions run id (used to build the run URL).'
+    required: true
+  run-url:
+    description: 'GitHub Actions run URL.'
+    required: true
+  app-url:
+    description: 'Public app URL — included only for prod messages.'
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: 💬 Slack notification
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        # Pre-computed derived values — keeps the payload template below readable.
+        STATUS: ${{ inputs.status }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        SERVICE: ${{ inputs.service }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        AUTHOR: ${{ inputs.author }}
+        RUN_URL: ${{ inputs.run-url }}
+        APP_URL: ${{ inputs.app-url }}
+      shell: bash
+      run: |
+        # ------------------------------------------------------------------
+        # Pick the header text + emoji from the (status, environment) pair.
+        # Doing this in shell keeps the action.yml YAML small and avoids
+        # having to ship a JS action for what is just a lookup.
+        # ------------------------------------------------------------------
+        case "${STATUS}/${ENVIRONMENT}" in
+          success/dev)
+            HEADER="✅ Dev Deployment Successful"
+            EMOJI=":white_check_mark:" ;;
+          failure/dev)
+            HEADER="❌ Dev Deployment Failed"
+            EMOJI=":x:" ;;
+          success/prod)
+            HEADER="🎉 PROD Deployment Successful"
+            EMOJI=":tada:" ;;
+          failure/prod)
+            HEADER="❌ PROD Deployment Failed"
+            EMOJI=":x:" ;;
+          *)
+            HEADER="${ENVIRONMENT} Deployment ${STATUS}"
+            EMOJI=":warning:" ;;
+        esac
+
+        # Build the fields JSON. Order matters — Slack renders them in order.
+        FIELDS=$(jq -n \
+          --arg service  "${SERVICE}" \
+          --arg env      "${ENVIRONMENT}" \
+          --arg tag      "${IMAGE_TAG}" \
+          --arg sha      "${COMMIT_SHA}" \
+          --arg author   "${AUTHOR}" \
+          --arg run_url  "${RUN_URL}" \
+          --arg app_url  "${APP_URL}" \
+          '
+          [
+            {type:"mrkdwn", text:"*Service:*\n\($service)"},
+            {type:"mrkdwn", text:"*Environment:*\n\($env | ascii_upcase | gsub("DEV";"Dev")) EKS"},
+            {type:"mrkdwn", text:"*Image Tag:*\n`\($tag)`"},
+            {type:"mrkdwn", text:"*Commit:*\n`\($sha)`"},
+            {type:"mrkdwn", text:"*Author:*\n\($author)"},
+            {type:"mrkdwn", text:"*Run:*\n<\($run_url)|View Run>"}
+          ]
+          + (if $app_url != "" then [{type:"mrkdwn", text:"*App URL:*\n<\($app_url)|Open App>"}] else [] end)
+          + (if $env == "prod" and $status == "success"
+             then [{type:"mrkdwn", text:"*Timestamp:*\n" + (now | strftime("%Y-%m-%dT%H:%M:%SZ"))}]
+             else [] end)
+          ')
+
+        # Assemble the payload. Two shapes:
+        #   - success: header + fields grid
+        #   - failure: header + single section with summary + run link
+        if [ "${STATUS}" = "success" ]; then
+          PAYLOAD=$(jq -n \
+            --arg header "${HEADER}" \
+            --argjson fields "${FIELDS}" \
+            '{blocks: [
+              {type:"header", text:{type:"plain_text", text:$header, emoji:true}},
+              {type:"section", fields:$fields}
+            ]}')
+        else
+          PAYLOAD=$(jq -n \
+            --arg header "${HEADER}" \
+            --arg service "${SERVICE}" \
+            --arg sha "${COMMIT_SHA}" \
+            --arg author "${AUTHOR}" \
+            --arg run_url "${RUN_URL}" \
+            '{blocks: [
+              {type:"header", text:{type:"plain_text", text:$header, emoji:true}},
+              {type:"section", text:{type:"mrkdwn",
+                text:"*Service:* \($service)\n*Commit:* `\($sha)`\n*Author:* \($author)\n\n<\($run_url)|View Run Logs>"}}
+            ]}')
+        fi
+
+        # Send it. -f suppresses progress, -o /dev/null discards response body,
+        # -w '%{http_code}' captures the status code so we can surface failures.
+        HTTP_CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+          -X POST -H 'Content-type: application/json' \
+          --data "${PAYLOAD}" \
+          "${SLACK_WEBHOOK_URL}" || echo "000")
+
+        if [ "${HTTP_CODE}" != "200" ]; then
+          echo "::warning::Slack notification failed (HTTP ${HTTP_CODE})"
+          echo "${PAYLOAD}"
+        else
+          echo "✅ Slack notification sent (${ENVIRONMENT} ${STATUS})"
+        fi

@@ -87,7 +87,7 @@ repos:
 
 ### Reproducible Builds
 
-- Pin base image digest: `eclipse-temurin:21-jre-jammy@sha256:...`
+- Pin base image digest: `eclipse-temurin:17-jre-jammy@sha256:...`
 - Use `--provenance=true` in Docker build
 - Generate SBOM at build time (CycloneDX/SPDX)
 - Sign images with **Cosign**:
@@ -112,10 +112,10 @@ cosign sign --key cosign.key \
 
 ```dockerfile
 # Use JRE-only (not JDK) — no compiler, no dev tools
-FROM eclipse-temurin:21-jre-jammy AS runtime
+FROM eclipse-temurin:17-jre-jammy AS runtime
 
 # Pin to digest in production
-# FROM eclipse-temurin:21-jre-jammy@sha256:abc123...
+# FROM eclipse-temurin:17-jre-jammy@sha256:abc123...
 ```
 
 ### Layered Image (defense in depth)

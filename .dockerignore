@@ -1,0 +1,40 @@
+# Repo-root .dockerignore — applies when the build context is the repo root
+# (as set by the workflow's `context: .`). Keep only what the Dockerfile needs.
+#
+# The Dockerfile currently COPYs:
+#   java-app/pom.xml
+#   java-app/.mvn
+#   java-app/mvnw
+#   java-app/src
+
+# Everything outside java-app/
+iam/
+charts/
+k8s/
+docs/
+scripts/
+.git/
+.github/
+
+# VCS metadata
+.gitignore
+.gitattributes
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# The Dockerfile itself + any nested .dockerignore
+Dockerfile
+.dockerignore
+
+# Build artifacts that might land at the root from a previous run
+target/
+*.jar
+*.war

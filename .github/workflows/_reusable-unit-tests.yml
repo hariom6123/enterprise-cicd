@@ -1,0 +1,45 @@
+name: Reusable — Unit Tests
+
+# Internal reusable workflow — Surefire only (matches *Test, excludes *IT).
+# Callers use:
+#   jobs:
+#     unit-tests:
+#       uses: ./.github/workflows/_reusable-unit-tests.yml
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version to install.'
+        type: string
+        default: '17'
+
+jobs:
+  unit-tests:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☕ Setup Java ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: 🧪 Run Unit Tests
+        run: |
+          mvn -B -ntp test \
+            -Dtest='*Test,!*IT' \
+            -DfailIfNoTests=false
+
+      - name: 📊 Publish Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*.xml'
+          retention-days: 14
