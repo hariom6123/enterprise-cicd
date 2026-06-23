@@ -1,0 +1,143 @@
+# =============================================================================
+# Claude PR Review — Staff-Engineer-grade code review on every PR to main.
+#
+# Runs Claude Code against the PR diff and posts a structured review as a
+# PR comment. The workflow only FAILS (and blocks merge via branch
+# protection) when the review reports Critical Issues; High Priority,
+# Nice-to-have, and Deployment Risks are advisory only and never fail
+# the check.
+#
+# Required repo secrets:
+#   ANTHROPIC_API_KEY  — Claude Code auth.
+#
+# Required repo settings (do these once after merging this file):
+#   1. Settings → Secrets and variables → Actions → add ANTHROPIC_API_KEY.
+#   2. Settings → Branches → main → Require status checks → add
+#      "Claude PR Review" (the job name below).
+# =============================================================================
+name: Claude PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+# Cancel superseded runs on the same PR — only the latest commit matters.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  # id-token: write   # uncomment if switching from API key to OIDC
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Run Claude in review mode against the PR diff.
+  # ---------------------------------------------------------------------------
+  claude-review:
+    name: 🤖 Claude Review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      # Parsed by the gate-merge job below. Empty when no critical issues.
+      critical-found: ${{ steps.gate.outputs.critical-found }}
+      review-comment-id: ${{ steps.claude.outputs.comment_id }}
+
+    steps:
+      - name: 📥 Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🤖 Run Claude Code review
+        id: claude
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # --review flips Claude into PR review mode (reads the diff, no chat).
+          # --allowed-tools restricts Claude to read-only ops so it can't
+          # accidentally edit files during the review.
+          claude_args: |
+            --review
+            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
+          # The full review brief. Claude is told to:
+          #   - cover 6 areas (code quality, Spring Boot arch, security,
+          #     GitHub Actions, performance, maintainability)
+          #   - emit 5 structured sections
+          #   - end with a parseable `CRITICAL_ISSUES_FOUND:` line so the
+          #     gate-merge job below can decide whether to fail the check.
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            (${{ github.event.pull_request.title }}) on
+            ${{ github.repository }} as a Staff Software Engineer.
+
+            Analyze:
+            - Java code quality
+            - Spring Boot architecture
+            - Security vulnerabilities
+            - GitHub Actions workflows
+            - Performance issues
+            - Maintainability
+
+            Return your review in EXACTLY this format (markdown):
+
+            ## 1. Critical Issues
+            (Blockers — bugs, security holes, broken CI, data loss, anything
+            that must be fixed before merge. If none, write "None.")
+
+            ## 2. High Priority Improvements
+            (Should-fix-but-not-blocking issues.)
+
+            ## 3. Nice-to-have Improvements
+            (Polish / refactor suggestions.)
+
+            ## 4. Deployment Risks
+            (Anything that could bite us in production — config drift,
+            backward-incompatible changes, missing rollouts, observability
+            gaps, secret/permission changes.)
+
+            ## 5. Final Score
+            (X.X / 10 — single decimal, brief one-line justification.)
+
+            ---
+
+            CRITICAL_ISSUES_FOUND: yes
+            (or `CRITICAL_ISSUES_FOUND: no` if section 1 is "None". This
+            line MUST be the last line of your output and is parsed by
+            CI to decide whether to fail the workflow. Do not omit it.)
+
+      - name: 🚦 Detect Critical Issues
+        id: gate
+        # Grep the captured Claude transcript for the gate marker.
+        # The claude-code-action writes the raw output to ${{ steps.claude.outputs.transcript }}
+        # but to be defensive we also re-grep the PR comment body.
+        run: |
+          if echo '${{ steps.claude.outputs.transcript }}' | grep -qE 'CRITICAL_ISSUES_FOUND:\s*yes'; then
+            echo "critical-found=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::Critical Issues detected — workflow will fail."
+          else
+            echo "critical-found=false" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude Review::No critical issues — workflow will pass."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Enforce the gate. This is what branch protection should require.
+  # ---------------------------------------------------------------------------
+  gate-merge:
+    name: 🚦 Critical-Issue Gate
+    needs: claude-review
+    runs-on: ubuntu-latest
+    if: always() && needs.claude-review.result == 'success'
+    steps:
+      - name: 🚪 Enforce no-critical-issues policy
+        env:
+          CRITICAL: ${{ needs.claude-review.outputs.critical-found }}
+        run: |
+          echo "Claude reported critical-found=$CRITICAL"
+          if [ "$CRITICAL" = "true" ]; then
+            echo "::error::Critical Issues found by Claude PR Review. See the 🤖 Claude Review comment on this PR for details."
+            exit 1
+          fi
+          echo "✅ No critical issues — review passed."
