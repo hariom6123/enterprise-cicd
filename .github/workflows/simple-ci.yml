@@ -201,50 +201,138 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Agent 1 - Dependency Vulnerability Analyst (Java Spring Boot)
         env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
         run: |
+          set -euo pipefail
+
           echo "🤖 Running Agent 1: Dependency Vulnerability Analyst..."
 
-          REPORT=$(cat java-app/pom.xml 2>/dev/null || echo "No pom.xml found")
-
-          PAYLOAD=$(jq -n \
-            --arg report "$REPORT" \
-            '{
-              model: "meta/llama-3.1-70b-instruct",
-              max_tokens: 1024,
-              messages: [{
-                role: "user",
-                content: ("You are a Java Spring Boot security expert..." + $report)
-              }]
-            }')
-
-          RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $NVD_API_KEY" \
-            -d "$PAYLOAD")
-
-          if [ -z "$RESPONSE" ]; then
-            echo "::error::No response received from NVIDIA API."
+          if [ -z "${NVDAI_API_KEY:-}" ]; then
+            echo "::error::Repository secret NVDAI_API_KEY is missing."
             exit 1
           fi
 
-          REPORT_OUTPUT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Agent response unavailable"')
+          REPORT=$(cat java-app/pom.xml)
+
+          PROMPT=$(cat <<EOF
+          You are a Senior Java Spring Boot Security Engineer.
+
+          Analyze the following Maven pom.xml dependencies.
+
+          Return your response in EXACTLY this format.
+
+          --------------------------------------------------
+
+          🤖 Agent 1 - Dependency Vulnerability Analysis
+
+          --------------------------------------------------
+
+          ## Dependency Analysis
+
+          ### CRITICAL
+          - List vulnerable dependencies or write "None"
+
+          ### HIGH
+          - List vulnerable dependencies or write "None"
+
+          ### MEDIUM
+          - List vulnerable dependencies or write "None"
+
+          ### LOW
+          - List vulnerable dependencies or write "None"
+
+          ## Recommended Upgrades
+
+          For every vulnerable dependency provide:
+
+          - Current Version
+          - Recommended Version
+          - Reason for upgrade
+
+          ## Authentication / API Security Impact
+
+          Mention whether any dependency affects:
+
+          - Spring Security
+          - Authentication
+          - JWT
+          - OAuth2
+          - Database Connectivity
+          - REST API Security
+          - Serialization
+
+          ## Overall Dependency Risk Score
+
+          Provide a score out of 10.
+
+          ## Final Recommendation
+
+          If everything is safe write:
+
+          No critical dependency vulnerabilities detected.
+
+          Otherwise provide concise remediation steps.
+
+          Here is the pom.xml:
+
+          $REPORT
+          EOF
+          )
+
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            '{
+              "model": "meta/llama-3.1-70b-instruct",
+              "max_tokens": 1024,
+              "temperature": 0.2,
+              "messages": [
+                {
+                  "role": "user",
+                  "content": $prompt
+                }
+              ]
+            }')
+
+          HTTP_CODE=$(curl -s \
+            -o response.json \
+            -w "%{http_code}" \
+            https://integrate.api.nvidia.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -d "$PAYLOAD")
+
+          echo "HTTP Status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::NVIDIA API request failed."
+
+            echo "===================="
+            echo "Response from API"
+            echo "===================="
+
+            cat response.json
+
+            exit 1
+          fi
+
+          REPORT_OUTPUT=$(jq -r '.choices[0].message.content // "No response returned."' response.json)
 
           echo "$REPORT_OUTPUT" > dependency-analysis-report.md
 
+          echo ""
           echo "──────────────────────────────────────────"
           echo "🤖 Agent 1 - Dependency Vulnerability Analysis"
           echo "──────────────────────────────────────────"
           cat dependency-analysis-report.md
 
-          echo "# 🤖 AI Dependency Vulnerability Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          cat dependency-analysis-report.md >> $GITHUB_STEP_SUMMARY
+          {
+            echo "# 🤖 AI Dependency Vulnerability Report"
+            echo ""
+            cat dependency-analysis-report.md
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Dependency Analysis Report
         uses: actions/upload-artifact@v4
