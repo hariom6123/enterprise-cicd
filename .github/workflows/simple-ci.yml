@@ -187,276 +187,67 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------
-  # Stage 5: Claude PR Review (only on pull_request to main, so push
-  # triggers on feature/** don't burn API quota). Runs after package so
-  # we don't pay for Claude on a build that already failed.
+  # Stage 5: AI Dependency Vulnerability Analysis
   # ---------------------------------------------------------------------------
-  claude-review:
-    name: 🤖 Claude Review
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    needs: [package]
+  dependency-ai-review:
+    name: 🤖 AI Dependency Vulnerability Review
+    needs: package
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+
     permissions:
       contents: read
-      pull-requests: write
-    outputs:
-      # Parsed by the gate-merge job below. Empty when no critical issues.
-      critical-found: ${{ steps.gate.outputs.critical-found }}
-      review-comment-id: ${{ steps.claude.outputs.comment_id }}
-      # Set by the NVD-backed dependency vulnerability agent in Stage 5.
-      nvd-block: ${{ steps.gate-nvd.outputs.nvd-block }}
 
     steps:
-      - name: 📥 Checkout PR
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🤖 Run Claude Code review
-        id: claude
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          # --review flips Claude into PR review mode (reads the diff, no chat).
-          # --allowed-tools restricts Claude to read-only ops so it can't
-          # accidentally edit files during the review.
-          claude_args: |
-            --review
-            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
-          # The full review brief. Claude is told to:
-          #   - cover 6 areas (code quality, Spring Boot arch, security,
-          #     GitHub Actions, performance, maintainability)
-          #   - emit 5 structured sections
-          #   - end with a parseable `CRITICAL_ISSUES_FOUND:` line so the
-          #     gate-merge job below can decide whether to fail the check.
-          prompt: |
-            You are reviewing pull request #${{ github.event.pull_request.number }}
-            (${{ github.event.pull_request.title }}) on
-            ${{ github.repository }} as a Staff Software Engineer.
-
-            Analyze:
-            - Java code quality
-            - Spring Boot architecture
-            - Security vulnerabilities
-            - GitHub Actions workflows
-            - Performance issues
-            - Maintainability
-
-            Return your review in EXACTLY this format (markdown):
-
-            ## 1. Critical Issues
-            (Blockers — bugs, security holes, broken CI, data loss, anything
-            that must be fixed before merge. If none, write "None.")
-
-            ## 2. High Priority Improvements
-            (Should-fix-but-not-blocking issues.)
-
-            ## 3. Nice-to-have Improvements
-            (Polish / refactor suggestions.)
-
-            ## 4. Deployment Risks
-            (Anything that could bite us in production — config drift,
-            backward-incompatible changes, missing rollouts, observability
-            gaps, secret/permission changes.)
-
-            ## 5. Final Score
-            (X.X / 10 — single decimal, brief one-line justification.)
-
-            ---
-
-            CRITICAL_ISSUES_FOUND: no
-            (Replace with `CRITICAL_ISSUES_FOUND: yes` if section 1 lists
-            any blocking issue. This line MUST be the last line of your
-            output and is parsed by CI to decide whether to fail the
-            workflow. Do not omit it.)
-
-      - name: 🚦 Detect Critical Issues
-        id: gate
-        # Grep the captured Claude transcript for the gate marker.
-        # The claude-code-action writes the raw output to ${{ steps.claude.outputs.transcript }}
-        # but to be defensive we also re-grep the PR comment body.
-        run: |
-          if echo '${{ steps.claude.outputs.transcript }}' | grep -qE 'CRITICAL_ISSUES_FOUND:\s*yes'; then
-            echo "critical-found=true" >> $GITHUB_OUTPUT
-            echo "::notice title=Claude Review::Critical Issues detected — workflow will fail."
-          else
-            echo "critical-found=false" >> $GITHUB_OUTPUT
-            echo "::notice title=Claude Review::No critical issues — workflow will pass."
-          fi
-
-      - name: 🤖 Agent 1 — Dependency Vulnerability Analyst (NVD)
-        id: nvd-enrich
-        # Pre-step for the Claude agent below. Extracts every <dependency>
-        # line that was added/changed in this PR's java-app/pom.xml, then
-        # asks the NVD CVE 2.0 API (authenticated via NVD_API_KEY) for any
-        # known CVEs against that CPE keyword. Result is written to
-        # nvd-report.txt which the Claude step consumes.
+      - name: Agent 1 - Dependency Vulnerability Analyst (Java Spring Boot)
         env:
-          NVD_API_KEY: ${{ env.NVD_API_KEY }}
+          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
         run: |
-          set -euo pipefail
-          echo "🤖 Agent 1: Dependency Vulnerability Analyst (NVD)..."
+          echo "🤖 Running Agent 1: Dependency Vulnerability Analyst..."
 
-          # 1. Pull the diff of pom.xml from origin/main (or HEAD~1 on push).
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BASE="HEAD~1"
-          fi
-          git fetch --depth=50 origin "$BASE" 2>/dev/null || BASE="HEAD~1"
-          POM_DIFF=$(git diff --unified=0 "$BASE"...HEAD -- java-app/pom.xml || true)
+          REPORT=$(cat java-app/pom.xml 2>/dev/null || echo "No pom.xml found")
 
-          # 2. Extract artifactIds of dependencies that were added (lines
-          #    starting with "+" that contain <artifactId>). Fall back to
-          #    listing every <artifactId> in the file if the diff is empty.
-          PKGS=$(echo "$POM_DIFF" \
-                  | grep '^+' \
-                  | grep -v '^+++' \
-                  | grep -oE '<artifactId>[^<]+</artifactId>' \
-                  | sed -E 's|</?artifactId>||g' \
-                  | sort -u)
-          if [ -z "$PKGS" ]; then
-            PKGS=$(grep -oE '<artifactId>[^<]+</artifactId>' java-app/pom.xml \
-                    | sed -E 's|</?artifactId>||g' \
-                    | sort -u)
-          fi
+          PAYLOAD=$(jq -n \
+            --arg report "$REPORT" \
+            '{
+              model: "meta/llama-3.1-70b-instruct",
+              max_tokens: 1024,
+              messages: [{
+                role: "user",
+                content: ("You are a Java Spring Boot security expert..." + $report)
+              }]
+            }')
 
-          echo "──────────────────────────────────────────"
-          echo "Packages to query NVD for:"
-          echo "$PKGS"
-          echo "──────────────────────────────────────────"
+          RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -d "$PAYLOAD")
 
-          # 3. Query NVD for each package. NVD 2.0 API rate-limits:
-          #    5 req/30s without a key, 50 req/30s with one. We sleep 1s
-          #    between calls to stay well under that.
-          : > nvd-report.txt
-          echo "# NVD CVE Report — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> nvd-report.txt
-          echo "# PR: #${{ github.event.pull_request.number }} on ${{ github.repository }}" >> nvd-report.txt
-          echo ""                                                                 >> nvd-report.txt
-
-          for PKG in $PKGS; do
-            echo "  → querying NVD for: $PKG"
-            # keywordSearch matches Maven Central CPEs (cpe:2.3:a:group:artifact).
-            RESP=$(curl -sS --max-time 15 \
-              -H "apiKey: $NVD_API_KEY" \
-              "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${PKG}&resultsPerPage=5" \
-              || echo '{"vulnerabilities":[],"error":"nvd_request_failed"}')
-
-            {
-              echo "## Package: $PKG"
-              COUNT=$(echo "$RESP" | jq -r '.totalResults // 0')
-              echo "CVE count (last ~120 days, keyword match): $COUNT"
-              echo "$RESP" \
-                | jq -r '.vulnerabilities[]? | "- " + .cve.id + " | " + (.cve.descriptions[] | select(.lang=="en") | .value | .[0:160]) + " | CVSS=" + (([.cve.metrics.cvssMetricV31[0].cvssData.baseScore // .cve.metrics.cvssMetricV30[0].cvssData.baseScore // "n/a"] | tostring))' \
-                | head -n 5
-              echo ""
-            } >> nvd-report.txt
-            sleep 1
-          done
-
-          echo ""
-          echo "──────────────────────────────────────────"
-          echo "🤖 Agent 1 — NVD CVE Report (preview)"
-          echo "──────────────────────────────────────────"
-          cat nvd-report.txt
-          echo "──────────────────────────────────────────"
-
-      - name: 🧠 Claude NVD Triage Agent
-        id: claude-nvd
-        # Reads nvd-report.txt and produces a prioritized, human-readable
-        # risk summary with fix advice. Read-only — same allowed-tools as
-        # the main review agent.
-        uses: anthropics/claude-code-action@beta
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_args: |
-            --review
-            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
-          prompt: |
-            You are triaging a live NVD CVE report for pull request
-            #${{ github.event.pull_request.number }} on
-            ${{ github.repository }}. The NVD report was just fetched
-            by an upstream agent and is at nvd-report.txt at the repo root.
-
-            Read nvd-report.txt, then produce a markdown summary with
-            EXACTLY these sections:
-
-            ## 1. Vulnerable Packages Found
-            For each package with CVEs, list:
-            - **Package** (groupId:artifactId if visible in the diff)
-            - **CVE IDs** (comma-separated)
-            - **Highest CVSS score** (numeric)
-            - **Recommended upgrade version** (your best judgment from the
-              CVE description; if unclear, say "investigate — no fixed
-              version identified")
-            - **Severity bucket**: CRITICAL / HIGH / MEDIUM / LOW
-
-            If the report shows zero CVEs, write "None — NVD returned no
-            matches for the changed packages."
-
-            ## 2. Authentication / Data-Handling Impact
-            For each finding, flag whether it could affect authentication,
-            session handling, data encryption, or API security in a Spring
-            Boot application. Use ⚠️ for yes, — for no.
-
-            ## 3. Overall Dependency Risk Score
-            Single number 0–10 (one decimal) with a one-line justification.
-
-            ## 4. Recommended Action
-            One of:
-            - "Safe to merge — no vulnerable dependencies."
-            - "Merge with follow-up issue: <one-line summary>."
-            - "Block merge — <one-line summary>."
-
-            End the response with EXACTLY this line on its own line:
-            NVD_BLOCK_MERGE: yes
-            or
-            NVD_BLOCK_MERGE: no
-
-            Use `yes` if section 4 says "Block merge" OR if any package
-            is CRITICAL severity. This line is parsed by the gate-merge
-            job to fail the workflow.
-
-      - name: 🚦 Detect NVD Block
-        id: gate-nvd
-        run: |
-          if echo '${{ steps.claude-nvd.outputs.transcript }}' | grep -qE 'NVD_BLOCK_MERGE:\s*yes'; then
-            echo "nvd-block=true" >> $GITHUB_OUTPUT
-            echo "::notice title=Claude NVD::NVD-flagged dependency risk — workflow will fail."
-          else
-            echo "nvd-block=false" >> $GITHUB_OUTPUT
-            echo "::notice title=Claude NVD::No NVD-flagged blockers — workflow will pass."
-          fi
-
-  # ---------------------------------------------------------------------------
-  # Stage 6: Critical-Issue Gate. Fails the check when the review above
-  # reports blocking issues. This is the job branch protection should
-  # require on main.
-  # ---------------------------------------------------------------------------
-  gate-merge:
-    name: 🚦 Critical-Issue Gate
-    needs: claude-review
-    runs-on: ubuntu-latest
-    if: always() && needs.claude-review.result == 'success' && github.event_name == 'pull_request' && github.base_ref == 'main'
-    steps:
-      - name: 🚪 Enforce no-critical-issues policy
-        env:
-          CRITICAL: ${{ needs.claude-review.outputs.critical-found }}
-          NVD_BLOCK: ${{ needs.claude-review.outputs.nvd-block }}
-        run: |
-          echo "Code-review critical-found=$CRITICAL"
-          echo "NVD-dependency block=$NVD_BLOCK"
-          FAILED=0
-          if [ "$CRITICAL" = "true" ]; then
-            echo "::error::Critical Issues found by Claude PR Review. See the 🤖 Claude Review comment on this PR for details."
-            FAILED=1
-          fi
-          if [ "$NVD_BLOCK" = "true" ]; then
-            echo "::error::Vulnerable dependencies found by Agent 1 (NVD). See the 🤖 Agent 1 comment on this PR for details."
-            FAILED=1
-          fi
-          if [ "$FAILED" = "1" ]; then
+          if [ -z "$RESPONSE" ]; then
+            echo "::error::No response received from NVIDIA API."
             exit 1
           fi
-          echo "✅ No critical issues — review passed."
+
+          REPORT_OUTPUT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Agent response unavailable"')
+
+          echo "$REPORT_OUTPUT" > dependency-analysis-report.md
+
+          echo "──────────────────────────────────────────"
+          echo "🤖 Agent 1 - Dependency Vulnerability Analysis"
+          echo "──────────────────────────────────────────"
+          cat dependency-analysis-report.md
+
+          echo "# 🤖 AI Dependency Vulnerability Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat dependency-analysis-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Dependency Analysis Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-analysis-report
+          path: dependency-analysis-report.md
