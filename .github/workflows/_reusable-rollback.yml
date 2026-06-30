@@ -1,0 +1,126 @@
+name: Reusable — Rollback Validation
+
+# Internal reusable workflow — post-prod-deploy validation: prints Helm
+# history, dry-runs a rollback, captures the current manifest, and uploads
+# a ROLLBACK.md runbook as an artifact.
+#
+# Callers use:
+#   jobs:
+#     rollback-validation:
+#       uses: ./.github/workflows/_reusable-rollback.yml
+#       with:
+#         cluster-name: prod-eks
+#         namespace: spring-boot-app-prod
+#         ...
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        description: 'AWS region.'
+        type: string
+        required: true
+      aws-account-id:
+        description: 'AWS account id.'
+        type: string
+        required: true
+      cluster-name:
+        description: 'EKS cluster name.'
+        type: string
+        required: true
+      namespace:
+        description: 'Kubernetes namespace containing the release.'
+        type: string
+        required: true
+      helm-release:
+        description: 'Helm release name.'
+        type: string
+        default: 'spring-boot-app'
+      app-url:
+        description: 'Public app URL — included in the ROLLBACK.md verification commands.'
+        type: string
+        required: false
+        default: 'app.example.com'
+
+jobs:
+  rollback-validation:
+    name: 🔄 Rollback Validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.aws-account-id }}:role/github-actions-eks-deploy
+          role-session-name: github-actions-rollback-${{ github.run_id }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: ⚙️ Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ inputs.cluster-name }} \
+            --region ${{ inputs.aws-region }} \
+            --alias prod
+
+      - name: 🔍 Validate Rollback Strategy
+        run: |
+          echo "=== Testing Rollback Strategy ==="
+          echo "Helm history:"
+          helm history ${{ inputs.helm-release }} -n ${{ inputs.namespace }}
+
+          PREVIOUS_REVISION=$(helm history ${{ inputs.helm-release }} -n ${{ inputs.namespace }} -o json | \
+            jq -r '[.[] | select(.status == "deployed")] | .[0].revision')
+          echo "Current deployed revision: $PREVIOUS_REVISION"
+
+          echo "Rollback dry-run test:"
+          helm rollback ${{ inputs.helm-release }} --dry-run -n ${{ inputs.namespace }} 2>&1 || echo "Dry-run completed"
+
+          echo "Checking deployment backup..."
+          kubectl get deployment ${{ inputs.helm-release }} -n ${{ inputs.namespace }} -o yaml > /tmp/current-deployment.yaml
+          echo "✅ Current deployment manifest saved"
+
+          echo "HPA Status:"
+          kubectl get hpa -n ${{ inputs.namespace }}
+
+          echo "PDB Status:"
+          kubectl get pdb -n ${{ inputs.namespace }}
+
+          echo "Service endpoints:"
+          kubectl get endpoints -n ${{ inputs.namespace }}
+
+          echo "✅ Rollback validation complete"
+
+      - name: 📝 Create Rollback Documentation
+        run: |
+          cat > ROLLBACK.md << EOF
+          # 🔄 Rollback Procedure
+
+          ## Quick Rollback
+          helm rollback ${{ inputs.helm-release }} -n ${{ inputs.namespace }}
+          helm rollback ${{ inputs.helm-release }} <revision> -n ${{ inputs.namespace }}
+
+          ## Emergency Rollback (kubectl)
+          kubectl rollout undo deployment/${{ inputs.helm-release }} -n ${{ inputs.namespace }}
+          kubectl rollout undo deployment/${{ inputs.helm-release }} --to-revision=<N> -n ${{ inputs.namespace }}
+          kubectl rollout status deployment/${{ inputs.helm-release }} -n ${{ inputs.namespace }}
+
+          ## Verify Rollback
+          kubectl get pods -n ${{ inputs.namespace }} -l app.kubernetes.io/name=${{ inputs.helm-release }}
+          kubectl logs -n ${{ inputs.namespace }} -l app.kubernetes.io/name=${{ inputs.helm-release }} --tail=100
+          curl https://${{ inputs.app-url }}/actuator/health
+          EOF
+          echo "✅ ROLLBACK.md created"
+
+      - name: 📤 Upload Rollback Guide
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-guide
+          path: ROLLBACK.md
+          retention-days: 90

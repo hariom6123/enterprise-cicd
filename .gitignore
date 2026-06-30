@@ -1,0 +1,5 @@
+# Claude Code local state — machine-specific, never commit
+.claude/settings.local.json
+
+# Maven flatten plugin output — generated, never commit
+**/.flattened-pom.xml

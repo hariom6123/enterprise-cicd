@@ -1,0 +1,71 @@
+name: Reusable — SonarQube Scan
+
+# Internal reusable workflow — SonarQube analysis + quality gate.
+# Callers must pass SONAR_TOKEN via secrets: inherit.
+#
+#   jobs:
+#     sonarqube-scan:
+#       uses: ./.github/workflows/_reusable-sonarqube.yml
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: 'JDK version to install.'
+        type: string
+        default: '17'
+      sonar-project-key:
+        description: 'SonarQube project key.'
+        type: string
+        default: 'spring-boot-app'
+      sonar-project-name:
+        description: 'SonarQube project display name.'
+        type: string
+        default: 'Spring Boot App'
+      sonar-host-url:
+        description: 'SonarQube server URL (optional override).'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      SONAR_TOKEN:
+        required: true
+
+jobs:
+  sonarqube-scan:
+    name: 🔬 SonarQube Scan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: ☕ Setup Java ${{ inputs.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java-version }}
+          cache: 'maven'
+
+      - name: 🔬 Run SonarQube Analysis
+        uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ inputs.sonar-host-url }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar-project-key }}
+            -Dsonar.projectName=${{ inputs.sonar-project-name }}
+            -Dsonar.java.binaries=target/classes
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+      - name: 📋 Quality Gate Check
+        uses: sonarsource/sonarqube-quality-gate-action@v2
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}

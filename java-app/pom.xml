@@ -6,8 +6,9 @@
 
     <!--
         Spring Boot 3.x parent provides managed versions for every dependency below.
-        Java 21 matches the pipeline's `JAVA_VERSION: '21'` env and the Temurin 21
-        builder/runtime images in the Dockerfile.
+        Java 17 matches the pipeline's `JAVA_VERSION: '17'` env and the Temurin 17
+        builder/runtime images in the Dockerfile. Java 17 is an LTS release and
+        the minimum version supported by Spring Boot 3.x.
     -->
     <parent>
         <groupId>org.springframework.boot</groupId>
@@ -32,9 +33,9 @@
 
     <properties>
         <revision>1.0.0</revision>
-        <java.version>21</java.version>
-        <maven.compiler.source>21</maven.compiler.source>
-        <maven.compiler.target>21</maven.compiler.target>
+        <java.version>17</java.version>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <!-- Plugin versions not managed by spring-boot-starter-parent -->
