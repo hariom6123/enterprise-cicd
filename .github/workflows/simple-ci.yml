@@ -206,7 +206,7 @@ jobs:
 
       - name: Agent 1 - Dependency Vulnerability Analyst (Java Spring Boot)
         env:
-          NVDAI_API_KEY: ${{ secrets.NVDAI_API_KEY }}
+          NVDAI_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           echo "🤖 Running Agent 1: Dependency Vulnerability Analyst..."
 
