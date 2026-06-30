@@ -25,6 +25,10 @@ on:
 
 env:
   IMAGE_NAME: spring-boot-app:ci-${{ github.sha }}
+  # NVD API key for the Claude Dependency Vulnerability Agent in Stage 5
+  # to query https://services.nvd.nist.gov/rest/json/cves/2.0 directly
+  # for live CVE lookups on any packages touched by the PR.
+  NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
 
 concurrency:
   group: simple-ci-${{ github.ref }}
@@ -200,6 +204,8 @@ jobs:
       # Parsed by the gate-merge job below. Empty when no critical issues.
       critical-found: ${{ steps.gate.outputs.critical-found }}
       review-comment-id: ${{ steps.claude.outputs.comment_id }}
+      # Set by the NVD-backed dependency vulnerability agent in Stage 5.
+      nvd-block: ${{ steps.gate-nvd.outputs.nvd-block }}
 
     steps:
       - name: 📥 Checkout PR
@@ -279,6 +285,150 @@ jobs:
             echo "::notice title=Claude Review::No critical issues — workflow will pass."
           fi
 
+      - name: 🤖 Agent 1 — Dependency Vulnerability Analyst (NVD)
+        id: nvd-enrich
+        # Pre-step for the Claude agent below. Extracts every <dependency>
+        # line that was added/changed in this PR's java-app/pom.xml, then
+        # asks the NVD CVE 2.0 API (authenticated via NVD_API_KEY) for any
+        # known CVEs against that CPE keyword. Result is written to
+        # nvd-report.txt which the Claude step consumes.
+        env:
+          NVD_API_KEY: ${{ env.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "🤖 Agent 1: Dependency Vulnerability Analyst (NVD)..."
+
+          # 1. Pull the diff of pom.xml from origin/main (or HEAD~1 on push).
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE="HEAD~1"
+          fi
+          git fetch --depth=50 origin "$BASE" 2>/dev/null || BASE="HEAD~1"
+          POM_DIFF=$(git diff --unified=0 "$BASE"...HEAD -- java-app/pom.xml || true)
+
+          # 2. Extract artifactIds of dependencies that were added (lines
+          #    starting with "+" that contain <artifactId>). Fall back to
+          #    listing every <artifactId> in the file if the diff is empty.
+          PKGS=$(echo "$POM_DIFF" \
+                  | grep '^+' \
+                  | grep -v '^+++' \
+                  | grep -oE '<artifactId>[^<]+</artifactId>' \
+                  | sed -E 's|</?artifactId>||g' \
+                  | sort -u)
+          if [ -z "$PKGS" ]; then
+            PKGS=$(grep -oE '<artifactId>[^<]+</artifactId>' java-app/pom.xml \
+                    | sed -E 's|</?artifactId>||g' \
+                    | sort -u)
+          fi
+
+          echo "──────────────────────────────────────────"
+          echo "Packages to query NVD for:"
+          echo "$PKGS"
+          echo "──────────────────────────────────────────"
+
+          # 3. Query NVD for each package. NVD 2.0 API rate-limits:
+          #    5 req/30s without a key, 50 req/30s with one. We sleep 1s
+          #    between calls to stay well under that.
+          : > nvd-report.txt
+          echo "# NVD CVE Report — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> nvd-report.txt
+          echo "# PR: #${{ github.event.pull_request.number }} on ${{ github.repository }}" >> nvd-report.txt
+          echo ""                                                                 >> nvd-report.txt
+
+          for PKG in $PKGS; do
+            echo "  → querying NVD for: $PKG"
+            # keywordSearch matches Maven Central CPEs (cpe:2.3:a:group:artifact).
+            RESP=$(curl -sS --max-time 15 \
+              -H "apiKey: $NVD_API_KEY" \
+              "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${PKG}&resultsPerPage=5" \
+              || echo '{"vulnerabilities":[],"error":"nvd_request_failed"}')
+
+            {
+              echo "## Package: $PKG"
+              COUNT=$(echo "$RESP" | jq -r '.totalResults // 0')
+              echo "CVE count (last ~120 days, keyword match): $COUNT"
+              echo "$RESP" \
+                | jq -r '.vulnerabilities[]? | "- " + .cve.id + " | " + (.cve.descriptions[] | select(.lang=="en") | .value | .[0:160]) + " | CVSS=" + (([.cve.metrics.cvssMetricV31[0].cvssData.baseScore // .cve.metrics.cvssMetricV30[0].cvssData.baseScore // "n/a"] | tostring))' \
+                | head -n 5
+              echo ""
+            } >> nvd-report.txt
+            sleep 1
+          done
+
+          echo ""
+          echo "──────────────────────────────────────────"
+          echo "🤖 Agent 1 — NVD CVE Report (preview)"
+          echo "──────────────────────────────────────────"
+          cat nvd-report.txt
+          echo "──────────────────────────────────────────"
+
+      - name: 🧠 Claude NVD Triage Agent
+        id: claude-nvd
+        # Reads nvd-report.txt and produces a prioritized, human-readable
+        # risk summary with fix advice. Read-only — same allowed-tools as
+        # the main review agent.
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: |
+            --review
+            --allowed-tools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*)"
+          prompt: |
+            You are triaging a live NVD CVE report for pull request
+            #${{ github.event.pull_request.number }} on
+            ${{ github.repository }}. The NVD report was just fetched
+            by an upstream agent and is at nvd-report.txt at the repo root.
+
+            Read nvd-report.txt, then produce a markdown summary with
+            EXACTLY these sections:
+
+            ## 1. Vulnerable Packages Found
+            For each package with CVEs, list:
+            - **Package** (groupId:artifactId if visible in the diff)
+            - **CVE IDs** (comma-separated)
+            - **Highest CVSS score** (numeric)
+            - **Recommended upgrade version** (your best judgment from the
+              CVE description; if unclear, say "investigate — no fixed
+              version identified")
+            - **Severity bucket**: CRITICAL / HIGH / MEDIUM / LOW
+
+            If the report shows zero CVEs, write "None — NVD returned no
+            matches for the changed packages."
+
+            ## 2. Authentication / Data-Handling Impact
+            For each finding, flag whether it could affect authentication,
+            session handling, data encryption, or API security in a Spring
+            Boot application. Use ⚠️ for yes, — for no.
+
+            ## 3. Overall Dependency Risk Score
+            Single number 0–10 (one decimal) with a one-line justification.
+
+            ## 4. Recommended Action
+            One of:
+            - "Safe to merge — no vulnerable dependencies."
+            - "Merge with follow-up issue: <one-line summary>."
+            - "Block merge — <one-line summary>."
+
+            End the response with EXACTLY this line on its own line:
+            NVD_BLOCK_MERGE: yes
+            or
+            NVD_BLOCK_MERGE: no
+
+            Use `yes` if section 4 says "Block merge" OR if any package
+            is CRITICAL severity. This line is parsed by the gate-merge
+            job to fail the workflow.
+
+      - name: 🚦 Detect NVD Block
+        id: gate-nvd
+        run: |
+          if echo '${{ steps.claude-nvd.outputs.transcript }}' | grep -qE 'NVD_BLOCK_MERGE:\s*yes'; then
+            echo "nvd-block=true" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude NVD::NVD-flagged dependency risk — workflow will fail."
+          else
+            echo "nvd-block=false" >> $GITHUB_OUTPUT
+            echo "::notice title=Claude NVD::No NVD-flagged blockers — workflow will pass."
+          fi
+
   # ---------------------------------------------------------------------------
   # Stage 6: Critical-Issue Gate. Fails the check when the review above
   # reports blocking issues. This is the job branch protection should
@@ -293,10 +443,20 @@ jobs:
       - name: 🚪 Enforce no-critical-issues policy
         env:
           CRITICAL: ${{ needs.claude-review.outputs.critical-found }}
+          NVD_BLOCK: ${{ needs.claude-review.outputs.nvd-block }}
         run: |
-          echo "Claude reported critical-found=$CRITICAL"
+          echo "Code-review critical-found=$CRITICAL"
+          echo "NVD-dependency block=$NVD_BLOCK"
+          FAILED=0
           if [ "$CRITICAL" = "true" ]; then
             echo "::error::Critical Issues found by Claude PR Review. See the 🤖 Claude Review comment on this PR for details."
+            FAILED=1
+          fi
+          if [ "$NVD_BLOCK" = "true" ]; then
+            echo "::error::Vulnerable dependencies found by Agent 1 (NVD). See the 🤖 Agent 1 comment on this PR for details."
+            FAILED=1
+          fi
+          if [ "$FAILED" = "1" ]; then
             exit 1
           fi
           echo "✅ No critical issues — review passed."
