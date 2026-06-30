@@ -206,7 +206,7 @@ jobs:
 
       - name: Agent 1 - Dependency Vulnerability Analyst (Java Spring Boot)
         env:
-          NVDAI_API_KEY: ${{ secrets.NVD_API_KEY }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           echo "🤖 Running Agent 1: Dependency Vulnerability Analyst..."
 
@@ -225,7 +225,7 @@ jobs:
 
           RESPONSE=$(curl -s https://integrate.api.nvidia.com/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $NVDAI_API_KEY" \
+            -H "Authorization: Bearer $NVD_API_KEY" \
             -d "$PAYLOAD")
 
           if [ -z "$RESPONSE" ]; then
