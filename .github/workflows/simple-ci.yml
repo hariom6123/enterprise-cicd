@@ -339,3 +339,55 @@ jobs:
         with:
           name: dependency-analysis-report
           path: dependency-analysis-report.md
+
+            # ---------------------------------------------------------------------------
+  # Stage 6: Final Security Summary Report
+  # ---------------------------------------------------------------------------
+  security-summary:
+    name: 📊 Security Summary
+    needs: dependency-ai-review
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download Dependency Analysis Report
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-analysis-report
+
+      - name: Generate Final Security Report
+        run: |
+          echo "# 🔐 Enterprise CI Security Report" > final-security-report.md
+          echo "" >> final-security-report.md
+          echo "**Repository:** ${{ github.repository }}" >> final-security-report.md
+          echo "**Branch:** ${{ github.ref_name }}" >> final-security-report.md
+          echo "**Commit:** ${{ github.sha }}" >> final-security-report.md
+          echo "**Workflow:** ${{ github.workflow }}" >> final-security-report.md
+          echo "**Run Number:** ${{ github.run_number }}" >> final-security-report.md
+          echo "" >> final-security-report.md
+
+          echo "## ✅ Pipeline Status" >> final-security-report.md
+          echo "- ✔ Build Completed" >> final-security-report.md
+          echo "- ✔ Unit Tests Passed" >> final-security-report.md
+          echo "- ✔ Trivy Security Scan Completed" >> final-security-report.md
+          echo "- ✔ Package Created Successfully" >> final-security-report.md
+          echo "- ✔ AI Dependency Review Completed" >> final-security-report.md
+          echo "" >> final-security-report.md
+
+          echo "---" >> final-security-report.md
+          echo "" >> final-security-report.md
+
+          echo "## 🤖 AI Dependency Vulnerability Analysis" >> final-security-report.md
+          cat dependency-analysis-report.md >> final-security-report.md
+
+      - name: Publish Job Summary
+        run: |
+          cat final-security-report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Final Security Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-security-report
+          path: final-security-report.md
